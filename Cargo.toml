@@ -1,5 +1,5 @@
 [package]
-name = "astrobox-ng-plugin-template-rust"
+name = "astrobox-plugin-miwear-interconn-fetch"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,10 +7,10 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-astrobox-ng-wit = "0.2.1"
+wit-bindgen = { version = "0.47.0", features = ["async", "async-spawn"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tracing-appender = "0.2"
 waki = "0.5.1"
 serde_json = "1.0"
-serde = "1.0"
+serde = { version = "1.0", features = ["derive"] }

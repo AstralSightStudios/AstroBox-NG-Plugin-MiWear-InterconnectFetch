@@ -1,0 +1,85 @@
+﻿package astrobox:main;
+
+// 傻逼vsc会在这报错 别管
+
+use astrobox:psys-host/os;
+use astrobox:psys-host/transport;
+use astrobox:psys-host/ui;
+use astrobox:psys-host/ui-v3;
+use astrobox:psys-host/dialog;
+use astrobox:psys-host/device;
+use astrobox:psys-host/register;
+use astrobox:psys-host/event;
+use astrobox:psys-host/provider-callback;
+use astrobox:psys-host/queue;
+use astrobox:psys-host/timer;
+use astrobox:psys-host/interconnect;
+use astrobox:psys-host/thirdpartyapp;
+use astrobox:psys-host/watchface;
+use astrobox:psys-host/i18n;
+
+use astrobox:psys-plugin/lifecycle;
+use astrobox:psys-plugin/event as plugin-event;
+use astrobox:psys-plugin/event-v3 as plugin-event-v3;
+
+world psys-world {
+  import os;
+  import transport;
+  import ui;
+  import ui-v3;
+  import dialog;
+  import device;
+  import register;
+  import event;
+  import provider-callback;
+  import queue;
+  import timer;
+  import interconnect;
+  import thirdpartyapp;
+  import watchface;
+  import i18n;
+
+  export lifecycle;
+  export plugin-event;
+}
+
+world psys-world-v2 {
+  import os;
+  import transport;
+  import ui;
+  import ui-v3;
+  import dialog;
+  import device;
+  import register;
+  import event;
+  import provider-callback;
+  import queue;
+  import timer;
+  import interconnect;
+  import thirdpartyapp;
+  import watchface;
+  import i18n;
+
+  export lifecycle;
+  export plugin-event;
+}
+
+world psys-world-v3 {
+  import os;
+  import transport;
+  import ui-v3;
+  import dialog;
+  import device;
+  import register;
+  import event;
+  import provider-callback;
+  import queue;
+  import timer;
+  import interconnect;
+  import thirdpartyapp;
+  import watchface;
+  import i18n;
+
+  export lifecycle;
+  export plugin-event-v3;
+}

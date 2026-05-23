@@ -1,0 +1,447 @@
+package astrobox:psys-host;
+
+interface os {
+    arch: func() -> future<string>;
+    hostname: func() -> future<string>;
+    locale: func() -> future<string>;
+    platform: func() -> future<string>;
+    version: func() -> future<string>;
+    astrobox-language: func() -> future<string>;
+    appearance: func() -> future<string>;
+    timezone-offset-minutes: func() -> future<s32>;
+}
+
+interface transport {
+    enum protocol {
+        XIAOMI-VELA-V5-PROTOBUF,
+    }
+
+    send: func(device-addr: string, data: list<u8>) -> future;
+    request: func(device-addr: string, data: list<u8>) -> future<result<list<u8>>>;
+    to-json: func(protocol: protocol, data: list<u8>) -> string;
+    from-json: func(protocol: protocol, data: string) -> result<list<u8>>;
+}
+
+interface dialog {
+    enum dialog-type {
+        ALERT,
+        INPUT
+    }
+
+    enum dialog-style {
+        WEBSITE,
+        SYSTEM
+    }
+
+    record dialog-button {
+        id: string,
+        primary: bool,
+        content: string
+    }
+
+    record dialog-info {
+        title: string,
+        content: string,
+        buttons: list<dialog-button>
+    }
+
+    record dialog-result {
+        clicked-btn-id: string,
+        input-result: string
+    }
+
+    record pick-config {
+        read: bool,
+        copy-to: option<string>,
+    }
+
+    record filter-config {
+        multiple: bool,
+        extensions: list<string>,
+        default-directory: string,
+        default-file-name: string,
+    }
+
+    record pick-result {
+        name: string,
+        data: list<u8>,
+    }
+
+    record save-session {
+        session-id: u64,
+        name: string,
+    }
+
+    show-dialog: func(dialog-type: dialog-type, style: dialog-style, info: dialog-info) -> future<dialog-result>;
+
+    pick-file: func(config: pick-config, filter: filter-config) -> future<pick-result>;
+
+    save-file-start: func(filter: filter-config) -> future<result<save-session>>;
+    save-file-write-chunk: func(session-id: u64, data: list<u8>) -> future<result>;
+    save-file-finish: func(session-id: u64) -> future<result>;
+    save-file-abort: func(session-id: u64) -> future;
+
+    open-url: func(url: string);
+}
+
+interface ui {
+    enum element-type {
+        BUTTON,
+        INPUT,
+        SELECT,
+        OPTION,
+        IMAGE,
+        VIDEO,
+        AUDIO,
+        SVG,
+        DIV,
+        SPAN,
+        P,
+    }
+
+    enum flex-direction {
+        ROW,
+        COLUMN,
+        ROW-REVERSE,
+        COLUMN-REVERSE,
+    }
+
+    resource element{
+        constructor(element-type:element-type,content:option<string>);
+        content:func(content:option<string>) -> element;
+
+        flex:func() -> element;
+        flex-direction:func(direction:flex-direction) -> element;
+
+        margin:func(margin:u32) -> element;
+        margin-top:func(margin:u32) -> element;
+        margin-bottom:func(margin:u32) -> element;
+        margin-left:func(margin:u32) -> element;
+        margin-right:func(margin:u32) -> element;
+
+        padding:func(padding:u32) -> element;
+        padding-top:func(padding:u32) -> element;
+        padding-bottom:func(padding:u32) -> element;
+        padding-left:func(padding:u32) -> element;
+        padding-right:func(padding:u32) -> element;
+
+        align-center:func() -> element;
+        align-end:func() -> element;
+        align-start:func() -> element;
+
+        justify-center:func() -> element;
+        justify-start:func() -> element;
+        justify-end:func() -> element;
+
+        bg:func(color:string) -> element;
+        text-color:func(color:string) -> element;
+
+        size:func(size:u32) -> element;
+        width:func(width:u32) -> element;
+        width-full:func() -> element;
+        width-half:func() -> element;
+        height:func(height:u32) -> element;
+        height-full:func() -> element;
+        height-half:func() -> element;
+        radius:func(radius:u32) -> element;
+        border:func(width:u32,color:string) -> element;
+
+        relative:func() -> element;
+        absolute:func() -> element;
+
+        top:func(position:u32) -> element;
+        bottom:func(position:u32) -> element;
+        left:func(position:u32) -> element;
+        right:func(position:u32) -> element;
+
+        opacity:func(opacity:f32) -> element;
+        transition:func(transition:string) -> element;
+        without-default-styles:func() -> element;
+
+        z-index:func(z:s32) -> element;
+        disabled:func() -> element;
+
+        child:func(child:element) -> element;
+
+        on:func(event:event,id:string) -> element;
+    }
+
+    enum event {
+        CLICK,
+        HOVER,
+        CHANGE,
+        INPUT,
+        FOCUS,
+        BLUR,
+        MOUSE-ENTER,
+        MOUSE-LEAVE,
+        POINTER-DOWN,
+        POINTER-UP,
+        POINTER-MOVE,
+    }
+
+    render:func(id:string,el:element);
+    render-to-text-card:func(id:string,text:string);
+}
+
+interface ui-v3 {
+    enum element-type {
+        BUTTON,
+        INPUT,
+        SELECT,
+        OPTION,
+        IMAGE,
+        VIDEO,
+        AUDIO,
+        SVG,
+        DIV,
+        SPAN,
+        P,
+        TEXTAREA,
+        SWITCH,
+        SLIDER,
+        PROGRESS,
+        GRID,
+        SCROLL-AREA,
+        CODE,
+        CARD,
+        TABS-ROOT,
+        TABS-LIST,
+        TABS-TRIGGER,
+        TABS-CONTENT,
+        CONTEXT-MENU-ROOT,
+        CONTEXT-MENU-TRIGGER,
+        CONTEXT-MENU-CONTENT,
+        CONTEXT-MENU-ITEM,
+        CONTEXT-MENU-SEPARATOR,
+        DIALOG-ROOT,
+        DIALOG-TRIGGER,
+        DIALOG-CONTENT,
+        DIALOG-TITLE,
+        DIALOG-DESCRIPTION,
+        DIALOG-CLOSE,
+        DROPDOWN-MENU-ROOT,
+        DROPDOWN-MENU-TRIGGER,
+        DROPDOWN-MENU-CONTENT,
+        DROPDOWN-MENU-ITEM,
+        DROPDOWN-MENU-SEPARATOR,
+        TOOLTIP,
+        CHECKBOX,
+        SEPARATOR,
+        BADGE,
+    }
+
+    enum flex-direction {
+        ROW,
+        COLUMN,
+        ROW-REVERSE,
+        COLUMN-REVERSE,
+    }
+
+    resource element{
+        constructor(element-type:element-type,content:option<string>);
+        content:func(content:option<string>) -> element;
+        prop:func(name:string,value:string) -> element;
+
+        flex:func() -> element;
+        flex-direction:func(direction:flex-direction) -> element;
+
+        margin:func(margin:u32) -> element;
+        margin-top:func(margin:u32) -> element;
+        margin-bottom:func(margin:u32) -> element;
+        margin-left:func(margin:u32) -> element;
+        margin-right:func(margin:u32) -> element;
+
+        padding:func(padding:u32) -> element;
+        padding-top:func(padding:u32) -> element;
+        padding-bottom:func(padding:u32) -> element;
+        padding-left:func(padding:u32) -> element;
+        padding-right:func(padding:u32) -> element;
+
+        align-center:func() -> element;
+        align-end:func() -> element;
+        align-start:func() -> element;
+
+        justify-center:func() -> element;
+        justify-start:func() -> element;
+        justify-end:func() -> element;
+
+        bg:func(color:string) -> element;
+        text-color:func(color:string) -> element;
+
+        size:func(size:u32) -> element;
+        width:func(width:u32) -> element;
+        width-full:func() -> element;
+        width-half:func() -> element;
+        height:func(height:u32) -> element;
+        height-full:func() -> element;
+        height-half:func() -> element;
+        radius:func(radius:u32) -> element;
+        border:func(width:u32,color:string) -> element;
+
+        relative:func() -> element;
+        absolute:func() -> element;
+
+        top:func(position:u32) -> element;
+        bottom:func(position:u32) -> element;
+        left:func(position:u32) -> element;
+        right:func(position:u32) -> element;
+
+        opacity:func(opacity:f32) -> element;
+        transition:func(transition:string) -> element;
+        transform:func(value:string) -> element;
+        transform-origin:func(value:string) -> element;
+        animation:func(value:string) -> element;
+        animation-name:func(name:string) -> element;
+        animation-duration-ms:func(ms:u32) -> element;
+        animation-delay-ms:func(ms:u32) -> element;
+        animation-easing:func(easing:string) -> element;
+        animation-iteration-count:func(count:string) -> element;
+        animation-direction:func(direction:string) -> element;
+        animation-fill-mode:func(fill-mode:string) -> element;
+        animation-play-state:func(play-state:string) -> element;
+        animation-preset:func(name:string) -> element;
+        will-change:func(value:string) -> element;
+        filter:func(value:string) -> element;
+        backdrop-filter:func(value:string) -> element;
+        perspective:func(value:string) -> element;
+        backface-visibility:func(value:string) -> element;
+        without-default-styles:func() -> element;
+        autofocus:func() -> element;
+        tab-index:func(index:s32) -> element;
+
+        z-index:func(z:s32) -> element;
+        disabled:func() -> element;
+
+        child:func(child:element) -> element;
+
+        on:func(event:event,id:string) -> element;
+
+        grid-template-columns:func(columns:string) -> element;
+        gap:func(spacing:u32) -> element;
+
+        max-width:func(width:u32) -> element;
+        max-height:func(height:u32) -> element;
+        min-width:func(width:u32) -> element;
+        min-height:func(height:u32) -> element;
+        scroll-top:func(position:u32) -> element;
+        scroll-left:func(position:u32) -> element;
+        scroll-to:func(top:u32, left:u32) -> element;
+        scroll-behavior:func(behavior:string) -> element;
+
+        flex-grow:func(value:f32) -> element;
+        flex-shrink:func(value:f32) -> element;
+    }
+
+    enum event {
+        CLICK,
+        HOVER,
+        CHANGE,
+        INPUT,
+        FOCUS,
+        BLUR,
+        MOUSE-ENTER,
+        MOUSE-LEAVE,
+        POINTER-DOWN,
+        POINTER-UP,
+        POINTER-MOVE,
+        KEY-DOWN,
+        KEY-UP,
+        LONG-PRESS,
+    }
+
+    render:func(id:string,el:element);
+    render-to-text-card:func(id:string,text:string);
+}
+
+
+interface device {
+    record device-info {
+        name: string,
+        addr: string
+    }
+
+    get-device-list: func() -> future<list<device-info>>;
+    get-connected-device-list: func() -> future<list<device-info>>;
+    disconnect-device: func(addr: string) -> future<result>;
+}
+
+interface register {
+    record transport-recv-filer {
+        xiaomi-vela-v5-channel-id: u32,
+        xiaomi-vela-v5-protobuf-typeid: u32,
+    }
+
+    enum provider-type {
+        URL,
+        CUSTOM
+    }
+
+    enum card-type {
+        ELEMENT,
+        TEXT
+    }
+
+    register-transport-recv: func(addr: string, filter: transport-recv-filer) -> future<result>;
+    register-interconnect-recv: func(addr: string, pkg-name: string) -> future<result>;
+    register-deeplink-action: func() -> future<result>;
+    register-provider: func(name: string, provider-type: provider-type) -> future<result>;
+    register-card: func(card-type: card-type, id: string, name: string) -> future<result>;
+}
+
+interface event {
+    send-event: func(event-name: string, payload: string);
+}
+
+interface provider-callback {
+    resolve-provider-action: func(request-id: string, response: string) -> bool;
+    report-provider-action-progress: func(request-id: string, progress: f32, status: string) -> bool;
+}
+
+interface queue {
+    enum resource-type {
+        quickapp,
+        watchface,
+        firmware
+    }
+
+    add-resource-to-queue: func(res-type: resource-type, file-path: string);
+}
+
+interface timer {
+    set-timeout: func(delay-ms: u64, payload: string) -> future<u64>;
+    set-interval: func(interval-ms: u64, payload: string) -> future<u64>;
+    clear-timer: func(timer-id: u64) -> future;
+}
+
+interface interconnect {
+    send-qaic-message: func(device-addr: string, pkg-name: string, data: string) -> future<result>;
+}
+
+interface thirdpartyapp {
+    record app-info {
+        package-name: string,
+        fingerprint: list<u32>,
+        version-code: u32,
+        can-remove: bool,
+        app-name: string
+    }
+
+    launch-qa: func(addr: string, app-info: app-info, page-name: string) -> future<result>;
+    get-thirdparty-app-list: func(addr: string) -> future<result<list<app-info>>>;
+}
+
+interface watchface {
+    record watchface-info {
+        id: string,
+        name: string,
+        is-current: bool,
+    }
+
+    get-watchface-list: func(addr: string) -> future<result<list<watchface-info>>>;
+    set-current-watchface: func(addr: string, watchface-id: string) -> future<result>;
+}
+
+interface i18n {
+    load-json: func(content: string) -> future<result>;
+}

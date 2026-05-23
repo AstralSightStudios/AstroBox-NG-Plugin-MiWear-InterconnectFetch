@@ -1,0 +1,51 @@
+package astrobox:psys-plugin;
+
+interface lifecycle {
+    on-load: func();
+}
+
+interface event {
+
+    enum event-type {
+        plugin-message,
+        interconnect-message, // 需plugin执行host接口register-interconnect-recv才会收到
+        device-action,
+        provider-action,
+        deeplink-action,
+
+        transport-packet, // 需plugin执行host接口register-transport-recv才会收到
+        timer,
+    }
+
+    on-event: func(event-type: event-type, event-payload: string) -> future<string>;
+
+    use astrobox:psys-host/ui.{event};
+    //element是组件id，event是事件类型，event-payload是事件数据
+    on-ui-event: func(event-id: string, event: event, event-payload: string) -> future<string>;
+
+    //在页面需要的适合执行，传入组件id，通过调用host的ui.render(id,el)函数渲染
+    on-ui-render: func(element-id: string) -> future;
+    on-card-render: func(card-id: string) -> future;
+}
+
+interface event-v3 {
+
+    enum event-type {
+        plugin-message,
+        interconnect-message, // 需plugin执行host接口register-interconnect-recv才会收到
+        device-action,
+        provider-action,
+        deeplink-action,
+
+        transport-packet, // 需plugin执行host接口register-transport-recv才会收到
+        timer,
+    }
+
+    on-event: func(event-type: event-type, event-payload: string) -> future<string>;
+
+    use astrobox:psys-host/ui-v3.{event};
+    on-ui-event-v3: func(event-id: string, event: event, event-payload: string) -> future<string>;
+
+    on-ui-render: func(element-id: string) -> future;
+    on-card-render: func(card-id: string) -> future;
+}
