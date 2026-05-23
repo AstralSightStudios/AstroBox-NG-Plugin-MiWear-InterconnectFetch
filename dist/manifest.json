@@ -1,0 +1,19 @@
+{
+    "name": "网桥 FetchBridge",
+    "icon": "icon.png",
+    "version": "1.0.0",
+    "description": "让不支持 fetch 的小米穿戴设备通过 interconnect 恢复其等价能力。",
+    "author": "Searchstars",
+    "website": "https://github.com/AstralSightStudios/AstroBox-NG-Plugin-MiWear-InterconnectFetch",
+    "entry": "astrobox_plugin_miwear_interconn_fetch.wasm",
+    "wasi_version": 2,
+    "api_level": 3,
+    "permissions": [
+        "thirdpartyapp",
+        "interconnect",
+        "register_interconnect_recv",
+        "register_card",
+        "device"
+    ],
+    "additional_files": []
+}
