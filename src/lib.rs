@@ -2,6 +2,7 @@ use wit_bindgen::FutureReader;
 
 use crate::exports::astrobox::psys_plugin::{event_v3 as event, event_v3::EventType, lifecycle};
 
+pub mod codec;
 pub mod fetch;
 pub mod handshake;
 pub mod interconnect;
@@ -115,11 +116,7 @@ fn dispatch_interconnect(addr: &str, pkg: &str, data: &str) {
 
     match tag.as_str() {
         handshake::HS_TAG => {
-            let count = body_value
-                .get("count")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            handshake::handle_packet(addr, pkg, count);
+            handshake::handle_packet(addr, pkg, &body_value);
             state::record_request(pkg, addr, None);
             ui::rerender();
         }
