@@ -30,6 +30,20 @@ const LOCAL_MAX_CHUNK_SIZE: usize = 4096;
 /// advertising an absurdly small value.
 const MIN_CHUNK_SIZE: usize = 256;
 
+/// Whether we support ACK-paced (windowed) chunk delivery. When both sides
+/// advertise this, the sender keeps at most `window` chunks in flight and waits
+/// for the peer's cumulative `fetch-ack` before sending more. Without it the
+/// old un-paced blast deadlocked large responses (see `transfer.rs`).
+const LOCAL_ACK_SUPPORTED: bool = true;
+/// Default number of chunks kept in flight before an ACK is required. The peer
+/// may request a smaller (or larger) window via `caps.ackWindow`.
+const DEFAULT_ACK_WINDOW: usize = 4;
+/// Clamp bounds for the negotiated window. The lower bound keeps a peer from
+/// advertising `0` (which would stall instantly); the upper bound stops a peer
+/// from re-introducing the unbounded blast by asking for a huge window.
+const MIN_ACK_WINDOW: usize = 1;
+const MAX_ACK_WINDOW: usize = 64;
+
 #[derive(Default)]
 struct HandshakeState {
     /// Per-(addr, pkg) handshake bookkeeping. Mirrors what the JS plugin tracks
@@ -73,6 +87,12 @@ struct PeerCaps {
     /// Compressions the peer can *decompress*, in preferred order. Empty means
     /// the peer didn't advertise — treat as `none` only.
     compressions: Vec<Compression>,
+    /// Whether the peer will emit `fetch-ack` frames for chunked responses. If
+    /// false we must not wait on ACKs (fall back to the legacy blast path).
+    ack: bool,
+    /// Peer's requested in-flight window in chunks. `0` = unspecified ⇒ use the
+    /// local default.
+    ack_window: usize,
 }
 
 /// What both sides agreed on for this session. Stored per-session so each
@@ -89,6 +109,10 @@ pub struct NegotiatedCaps {
     pub encodings: Vec<BodyEncoding>,
     /// Same for compression. Empty ⇒ `none`-only.
     pub compressions: Vec<Compression>,
+    /// In-flight chunk window for ACK-paced delivery. `0` ⇒ the peer can't ACK,
+    /// so chunked sends must fall back to the legacy un-paced path. `> 0` ⇒ the
+    /// sender keeps at most this many chunks in flight (see `transfer.rs`).
+    pub ack_window: usize,
 }
 
 static STATE: OnceLock<Mutex<HandshakeState>> = OnceLock::new();
@@ -167,12 +191,13 @@ pub fn handle_packet(addr: &str, pkg: &str, packet: &Value) {
 
     if !was_open && count_in > 0 {
         tracing::info!(
-            "handshake opened: addr={} pkg={} count={} chunked={} chunk_size={} encs={:?} comps={:?}",
+            "handshake opened: addr={} pkg={} count={} chunked={} chunk_size={} ack_window={} encs={:?} comps={:?}",
             addr,
             pkg,
             count_in,
             negotiated.as_ref().map(|c| c.chunked).unwrap_or(false),
             negotiated.as_ref().map(|c| c.chunk_size).unwrap_or(0),
+            negotiated.as_ref().map(|c| c.ack_window).unwrap_or(0),
             negotiated
                 .as_ref()
                 .map(|c| c.encodings.iter().map(|e| e.as_str()).collect::<Vec<_>>())
@@ -241,6 +266,11 @@ fn parse_caps(v: Option<&Value>) -> Option<PeerCaps> {
             .unwrap_or(0) as usize,
         encodings: parse_string_list(obj.get("encodings"), BodyEncoding::parse),
         compressions: parse_string_list(obj.get("compressions"), Compression::parse),
+        ack: obj.get("ack").and_then(|v| v.as_bool()).unwrap_or(false),
+        ack_window: obj
+            .get("ackWindow")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize,
     })
 }
 
@@ -283,12 +313,27 @@ fn negotiate(peer: PeerCaps) -> NegotiatedCaps {
         .filter(|c| SUPPORTED_COMPRESSIONS.contains(c))
         .collect();
 
+    // ACK-paced delivery only kicks in when we're actually chunking *and* the
+    // peer promised to send `fetch-ack` frames. A window of 0 means "no ACK
+    // flow control" and signals the producer to use the legacy blast path.
+    let ack_window = if chunked && LOCAL_ACK_SUPPORTED && peer.ack {
+        let requested = if peer.ack_window == 0 {
+            DEFAULT_ACK_WINDOW
+        } else {
+            peer.ack_window
+        };
+        requested.clamp(MIN_ACK_WINDOW, MAX_ACK_WINDOW)
+    } else {
+        0
+    };
+
     NegotiatedCaps {
         protocol_version: version,
         chunked,
         chunk_size,
         encodings,
         compressions,
+        ack_window,
     }
 }
 
@@ -302,5 +347,7 @@ fn local_caps_value() -> Value {
         "maxChunkSize": LOCAL_MAX_CHUNK_SIZE,
         "encodings": encodings,
         "compressions": compressions,
+        "ack": LOCAL_ACK_SUPPORTED,
+        "ackWindow": DEFAULT_ACK_WINDOW,
     })
 }

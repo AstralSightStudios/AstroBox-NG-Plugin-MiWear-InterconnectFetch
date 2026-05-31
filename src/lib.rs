@@ -9,6 +9,7 @@ pub mod interconnect;
 pub mod logger;
 pub mod persist;
 pub mod state;
+pub mod transfer;
 pub mod ui;
 
 wit_bindgen::generate!({
@@ -123,6 +124,11 @@ fn dispatch_interconnect(addr: &str, pkg: &str, data: &str) {
         fetch::FETCH_TAG => {
             fetch::handle_request(addr, pkg, body_value);
             ui::rerender();
+        }
+        fetch::FETCH_ACK_TAG => {
+            // Pure flow-control frame: advance the chunk window. No UI churn —
+            // these arrive once per chunk during a large transfer.
+            fetch::handle_ack(addr, pkg, body_value);
         }
         other => {
             tracing::warn!(

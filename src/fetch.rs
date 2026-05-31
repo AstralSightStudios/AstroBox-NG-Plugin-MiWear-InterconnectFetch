@@ -8,6 +8,7 @@ use crate::codec::{self, BodyEncoding, COMPRESS_MIN_SIZE, Compression};
 use crate::handshake::{self, NegotiatedCaps};
 use crate::interconnect;
 use crate::state;
+use crate::transfer;
 
 /// Tag used for the fetch request/response exchange (matches the JS client).
 pub const FETCH_TAG: &str = "fetch";
@@ -15,6 +16,11 @@ pub const FETCH_TAG: &str = "fetch";
 /// negotiated chunking via the v2+ handshake `caps`. Legacy peers never see
 /// this tag and continue receiving single-message responses.
 pub const FETCH_CHUNK_TAG: &str = "fetch-chunk";
+/// Tag the peer uses to acknowledge received chunks (v3 ACK flow control).
+/// Carries `{ id, ack }` where `ack` is the next contiguous chunk index the
+/// peer still needs. Drives the sliding window in `transfer.rs`. Only seen when
+/// both sides negotiated `caps.ack`.
+pub const FETCH_ACK_TAG: &str = "fetch-ack";
 
 #[derive(Debug, Deserialize)]
 pub struct FetchRequest {
@@ -171,6 +177,10 @@ struct TransferPlan {
     /// `Some(chunk_size)` when the response will be split across multiple
     /// frames; chunk_size is in bytes of `payload` per chunk.
     chunk_size: Option<usize>,
+    /// In-flight window for ACK-paced chunk delivery. `0` ⇒ the peer can't ACK,
+    /// so we fall back to the legacy un-paced blast. Only meaningful when
+    /// `chunk_size` is `Some`.
+    ack_window: usize,
 }
 
 fn build_plan(resp: &FetchResponse, caps: Option<&NegotiatedCaps>) -> TransferPlan {
@@ -186,12 +196,21 @@ fn build_plan(resp: &FetchResponse, caps: Option<&NegotiatedCaps>) -> TransferPl
 
     let encoding = pick_encoding(caps, &payload, resp.raw, chunk_size.is_some(), compression);
 
+    // Pace chunk delivery with ACKs whenever we're actually chunking and the
+    // peer negotiated a window. Otherwise stay on the legacy blast path.
+    let ack_window = if chunk_size.is_some() {
+        caps.map(|c| c.ack_window).unwrap_or(0)
+    } else {
+        0
+    };
+
     TransferPlan {
         compression,
         payload,
         original_bytes,
         encoding,
         chunk_size,
+        ack_window,
     }
 }
 
@@ -259,8 +278,10 @@ fn send_response(addr: &str, pkg: &str, id: Option<&str>, resp: FetchResponse) {
     let caps = handshake::negotiated_caps(addr, pkg);
     let plan = build_plan(&resp, caps.as_ref());
 
+    // `chunk_size` is `Copy`, so matching on it doesn't borrow `plan` — the
+    // chunked arm can take ownership and hand the payload off to `transfer`.
     match plan.chunk_size {
-        Some(cs) => send_chunked(addr, pkg, id, &resp, &plan, cs),
+        Some(cs) => send_chunked(addr, pkg, id, &resp, plan, cs),
         None => send_unchunked(addr, pkg, id, &resp, &plan),
     }
 }
@@ -310,14 +331,15 @@ fn send_chunked(
     pkg: &str,
     id: Option<&str>,
     resp: &FetchResponse,
-    plan: &TransferPlan,
+    plan: TransferPlan,
     chunk_size: usize,
 ) {
     let total_bytes = plan.payload.len();
     let chunk_count = total_bytes.div_ceil(chunk_size);
+    let ack_paced = plan.ack_window > 0;
 
     tracing::info!(
-        "fetch chunked: pkg={} addr={} id={} original={} compressed={} chunk_size={} chunks={} enc={} comp={}",
+        "fetch chunked: pkg={} addr={} id={} original={} compressed={} chunk_size={} chunks={} enc={} comp={} ack_window={}",
         pkg,
         addr,
         id.unwrap_or(""),
@@ -327,6 +349,7 @@ fn send_chunked(
         chunk_count,
         plan.encoding.as_str(),
         plan.compression.as_str(),
+        plan.ack_window,
     );
 
     // Header: keep every v1 field, then append v2 chunking metadata and any
@@ -358,8 +381,34 @@ fn send_chunked(
         // size its post-decompression buffer up front.
         resp_obj.insert("originalBytes".into(), Value::from(plan.original_bytes));
     }
+    // Tell the peer this transfer is ACK-paced so it knows to emit `fetch-ack`.
+    // Optional field; legacy peers (which never negotiate `ack`) never see it.
+    if ack_paced {
+        resp_obj.insert("ack".into(), Value::Bool(true));
+    }
     interconnect::send_json(addr, pkg, FETCH_TAG, wrap_with_id(id, "resp", Value::Object(resp_obj)));
 
+    // Header is out (compat rule #1). Now ship the body.
+    if ack_paced {
+        // ACK-paced path: register the transfer and prime the first window.
+        // `transfer` ships at most `window` chunks now and resumes from
+        // `handle_ack` as the peer acknowledges — bounding in-flight bytes and
+        // yielding control back to the host between bursts.
+        transfer::begin(
+            addr,
+            pkg,
+            id,
+            plan.payload,
+            chunk_size,
+            plan.encoding,
+            plan.ack_window,
+        );
+        return;
+    }
+
+    // Legacy un-paced path: the peer can't ACK, so blast every chunk in one go,
+    // exactly like v2. Fine for the modest responses such peers receive; large
+    // ones are why v3 added ACK pacing above.
     for (seq, chunk) in plan.payload.chunks(chunk_size).enumerate() {
         let encoded = codec::encode(chunk, plan.encoding)
             .unwrap_or_else(|_| codec::encode(chunk, BodyEncoding::Base64).unwrap());
@@ -372,6 +421,22 @@ fn send_chunked(
         msg.insert("data".to_string(), Value::String(encoded));
         interconnect::send_json(addr, pkg, FETCH_CHUNK_TAG, Value::Object(msg));
     }
+}
+
+/// Handle a peer `fetch-ack` frame: `{ id?, ack }`. `ack` is the next
+/// contiguous chunk index the peer still needs. Drives the sliding window so
+/// the next batch of chunks goes out (see `transfer::on_ack`).
+pub fn handle_ack(addr: &str, pkg: &str, body: Value) {
+    let id = body.get("id").and_then(|v| v.as_str());
+    let ack = body.get("ack").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    tracing::debug!(
+        "fetch-ack: pkg={} addr={} id={} ack={}",
+        pkg,
+        addr,
+        id.unwrap_or(""),
+        ack
+    );
+    transfer::on_ack(addr, pkg, id, ack);
 }
 
 fn send_error(addr: &str, pkg: &str, id: Option<&str>, message: &str) {

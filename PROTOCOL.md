@@ -13,7 +13,7 @@
 | ---- | -------- | ----------------------------------------------------------------------------------------- |
 | v1   | 永久兼容 | 握手计数 ping-pong；fetch 单消息响应（文本直传 或 base64）。                              |
 | v2   | 永久兼容 | 在 v1 基础上，握手包加入 `caps` 协商；新增 `fetch-chunk` 分片响应路径。                   |
-| v3   | 当前     | 在 v2 基础上，握手 `caps` 加入 `encodings` / `compressions` 数组，可协商编码与压缩方式。 |
+| v3   | 当前     | 在 v2 基础上：①握手 `caps` 加入 `encodings` / `compressions` 数组，可协商编码与压缩；②握手 `caps` 加入 `ack` / `ackWindow`，引入**滑动窗口 ACK 流控**（`fetch-ack`），修复大文件分片的死锁问题。 |
 
 **兼容承诺**：
 
@@ -21,6 +21,17 @@
 - v3 插件对 v3 快应用，按双方共同支持的能力交集 + 对端偏好顺序选择编码/压缩。
 - 任何 v3 快应用都必须保留对 v1 单消息 `base64`/`text` 响应的处理能力——
   这是首响应到达前协商尚未完成时的兜底路径。
+
+### ⚠️ 关于分片死锁 (v2 → v3 的关键修复)
+
+v2 的分片发送是**无流控**的：插件在**一次** `on_event` 调用里用一个紧凑 `for` 循环把所有
+`fetch-chunk` 帧背靠背地（每帧一次阻塞式 `send_qaic_message`）灌进 QAIC/BLE 通道。响应一旦较大，
+帧产出速度远超手表侧的消费速度；又因为插件在帧与帧之间**从不把控制权交还宿主**，宿主无法继续
+泵送底层传输——发送队列被填满后永不排空，整笔传输**死锁**。
+
+v3 用**累计 ACK + 滑动窗口**根治：发送方任一时刻最多让 `window` 个分片在途，发完即从 `on_event`
+**返回**；手表每收到分片回送一个 `fetch-ack`（携带它下一片连续缺口的序号），ACK 推进窗口后才继续
+发下一批。这样既给在途字节数封顶，又在每一批之间把控制权交还宿主让传输得以排空。详见 §5.2.1。
 
 ---
 
@@ -40,6 +51,7 @@
 | `__hs__`      | 双向                                              | 握手与能力协商。                           |
 | `fetch`       | 快应用 → 插件 (请求) / 插件 → 快应用 (响应或响应头) | HTTP 调用本体；当响应分片时仅承载头部元信息。 |
 | `fetch-chunk` | 插件 → 快应用                                     | 分片模式下携带响应体的某一分片。             |
+| `fetch-ack`   | 快应用 → 插件                                     | **v3 新增**：分片流控确认，告知插件已连续收到的分片进度，用于推进滑动窗口。 |
 
 未知 `tag` 应当被对端忽略（仅记日志），不得报错断开会话。
 
@@ -79,6 +91,8 @@ QuickApp                              FetchBridge
 | `maxChunkSize` | integer           | 服务端默认 | 本端可处理的单分片**编码前字节数**上限。                                              |
 | `encodings`    | array\<string\>   | `[]`       | 本端可**解码**的 wire 编码集合，**按偏好顺序排列**（第一个为最优先）。              |
 | `compressions` | array\<string\>   | `[]`       | 本端可**解压**的压缩算法集合，**按偏好顺序排列**。                                    |
+| `ack`          | boolean           | `false`    | 本端**是否会为分片响应回送 `fetch-ack`**。仅当快应用置 `true` 时，插件才启用滑动窗口流控；否则退回 v2 无流控分片。 |
+| `ackWindow`    | integer           | 插件默认   | 本端希望的在途分片窗口（单位：分片数）。插件会与自身上限取 `min` 并夹到 `[1, 64]`。缺省/`0` 表示采用插件默认。 |
 
 `encodings` 取值（详见 §6）：
 
@@ -108,6 +122,10 @@ negotiated.chunkSize     = clamp(min(peer.maxChunkSize || local.maxChunkSize,
                                  MIN_CHUNK_SIZE, local.maxChunkSize)
 negotiated.encodings     = peer.encodings ∩ local.encodings   // 保留 peer 顺序
 negotiated.compressions  = peer.compressions ∩ local.compressions
+negotiated.ackWindow     = (negotiated.chunked && local.ack && peer.ack)
+                             ? clamp(peer.ackWindow || DEFAULT_ACK_WINDOW,
+                                     MIN_ACK_WINDOW, MAX_ACK_WINDOW)
+                             : 0          // 0 = 不启用 ACK 流控，退回无流控分片
 ```
 
 **单次响应的编码/压缩选择**（由发送方按本端策略 + 对端偏好顺序决定）：
@@ -130,12 +148,19 @@ MIN_CHUNK_SIZE           = 256    bytes
 COMPRESS_MIN_SIZE        = 256    bytes  // 小于此阈值不压缩
 LOCAL_ENCODINGS          = ["base64", "hex", "text"]
 LOCAL_COMPRESSIONS       = ["none", "deflate", "lz4"]
+
+LOCAL_ACK_SUPPORTED      = true
+DEFAULT_ACK_WINDOW       = 4      chunks // 默认在途分片数
+MIN_ACK_WINDOW           = 1      chunks
+MAX_ACK_WINDOW           = 64     chunks
 ```
 
-- 任意一端未声明 `caps` ⇒ 全部走 v1 路径（单消息、`text`/`base64`、不压缩）。
+- 任意一端未声明 `caps` ⇒ 全部走 v1 路径（单消息、`text`/`base64`、不压缩、不分片、无 ACK）。
 - 任意一端 `chunk=false` ⇒ 不分片。
 - `version<2` ⇒ 不分片。
 - `encodings`/`compressions` 缺失或交集为空 ⇒ 走 v1/v2 baseline 默认值。
+- 快应用 `ack` 缺失或为 `false` ⇒ `ackWindow=0` ⇒ 分片走 v2 无流控路径（一次性发完所有分片）。
+  **只有快应用显式声明 `ack:true`，本插件才会启用滑动窗口并等待 `fetch-ack`。**
 
 ---
 
@@ -234,7 +259,10 @@ original bytes  --(raw ? keep : UTF-8 decode)--> 最终 body
 
     "bodyEncoding": "base64",    // 分片必然是 text 之外的二进制编码
     "compression":  "lz4",       // 可选；缺省 "none"
-    "originalBytes": 65536       // 可选；解压后字节数
+    "originalBytes": 65536,      // 可选；解压后字节数
+
+    "ack":          true         // 可选；为 true 表示本次分片启用 ACK 流控，
+                                 // 快应用必须按 §5.2.1 回送 fetch-ack。缺省/false ⇒ 无流控。
   }
 }
 ```
@@ -260,17 +288,93 @@ original bytes  --(raw ? keep : UTF-8 decode)--> 最终 body
 | `resp.bodyEncoding` | 分片场景一定是 `base64` 或 `hex`，决不会是 `text`。           |
 | `resp.compression` | 压缩算法；与单消息模式语义一致。                              |
 | `resp.originalBytes` | 解压后字节数；仅 `compression != "none"` 时出现。            |
+| `resp.ack`        | 可选 `true`，表示本次分片走 ACK 流控；快应用须回送 `fetch-ack`。缺省 ⇒ 无流控。 |
 | chunk `seq`       | 分片序号，`0..chunkCount-1`。                                  |
 | chunk `total`     | 冗余校验值，应与头部的 `chunkCount` 相等。                      |
 | chunk `data`      | 本分片的 `bodyEncoding` 编码。解码后长度应为 `chunkSize`，最后一片可能更短。 |
 
 **重组规则**：
 
-1. 收到 `resp.chunked === true` 时，按 `id` 建立缓冲区，记录 `chunkCount/totalBytes/raw/bodyEncoding/compression/originalBytes`。
-2. 每收到一个 `fetch-chunk`：按 `bodyEncoding` 解码 → 写入 `buffer[seq]`。
+1. 收到 `resp.chunked === true` 时，按 `id` 建立缓冲区，记录 `chunkCount/totalBytes/raw/bodyEncoding/compression/originalBytes`，并记下 `resp.ack` 是否为 `true`。
+2. 每收到一个 `fetch-chunk`：按 `bodyEncoding` 解码 → 写入 `buffer[seq]`。**若 `resp.ack` 为 `true`，随即按 §5.2.1 回送一帧 `fetch-ack`。**
 3. 全部 `chunkCount` 个分片到齐：拼接缓冲区，总长度应等于 `totalBytes`。
 4. 若 `compression != "none"`：按算法解压缩，结果长度应等于 `originalBytes`（若提供）。
 5. 若 `raw === false`：以 UTF-8 解码为字符串；否则保留为字节。
+
+### 5.2.1 ACK 流控（滑动窗口）
+
+> **动机**：见 §1「关于分片死锁」。无流控的背靠背发送会撑爆 QAIC/BLE 发送队列且不交还控制权，
+> 导致大文件分片死锁。ACK 流控让发送方在途分片数封顶，并在每批之间返回宿主以排空传输。
+
+**仅当**头部 `resp.ack === true`（即握手时双方都声明了 `ack` 能力）才启用。否则按 v2 无流控处理。
+
+#### `fetch-ack` 帧（快应用 → 插件）
+
+```json
+{
+  "tag": "fetch-ack",
+  "id":  "<原 id>",
+  "ack": 3
+}
+```
+
+| 字段  | 说明                                                                                       |
+| ----- | ------------------------------------------------------------------------------------------ |
+| `id`  | 与所确认的分片响应同一个 `id`（无 `id` 时省略，按空串匹配）。                              |
+| `ack` | **下一个仍缺失的连续分片序号** = 快应用已按序连续收到的分片数。即「`seq < ack` 的分片我全收到了」。当收齐全部时 `ack === chunkCount`。 |
+
+**`ack` 的精确语义（累计确认）**：快应用维护一个「连续前沿」——从 `seq=0` 起最长的、无空洞的
+已收区间长度 `k`，则 `ack = k`。例如已收到 `{0,1,3,4}`（缺 2）则 `ack=2`；待 2 补齐后，
+`{0,1,2,3,4}` 连续 ⇒ `ack=5`。快应用**乱序缓存**分片（按 `seq` 落位），因此一旦空洞补上，
+`ack` 会一次性跳到新的连续前沿。
+
+#### 发送方（插件）窗口逻辑
+
+设窗口大小 `W = negotiated.ackWindow`，维护 `base`（首个未确认分片 = 收到的最大 `ack`）与
+`next`（下一个待发序号）：
+
+```
+开始：发送头部帧 → base=0, next=0 → 发送 seq ∈ [0, W) 的分片 → 返回(让出控制权)
+
+收到 fetch-ack(ack)：
+  ack ← min(ack, chunkCount)            // 防御越界
+  若 ack > base:                        // 窗口前移
+      base ← ack
+      发送 seq ∈ [next, base+W) 且 < chunkCount 的分片，更新 next
+  否则若 next > base（有在途未确认，且本 base 尚未重传过）:  // 对端停在 base，疑似丢片
+      next ← base                       // go-back-N：回退重发整窗
+      重发 seq ∈ [base, base+W)，并记下「已为此 base 重传」
+  若 base ≥ chunkCount: 传输完成，释放该 id 的发送状态
+```
+
+- **稳态**：手表每收 1 片回 1 个 ACK，`base` 每次 +1，发送方补发 1 片，窗口始终填满、流水推进。
+- **丢片恢复**：底层 QAIC/BLE 本身可靠，丢片罕见。万一发生，对端持续回送同一个 `ack`（停滞），
+  发送方据此 go-back-N 回退重发该窗。**每个停滞点（`base` 值）只重传一次**——因为 `base` 单调递增，
+  一次丢片产生的那一串重复 ACK 不会触发重传风暴；待 `base` 真正推进后，新的停滞点才允许再次重传。
+  由于对端乱序缓存，补齐空洞后 `ack` 即跳过已缓存分片。
+- **超时清理**：若某传输长时间（实现取 30s）无任何 ACK，发送方丢弃其发送状态以防内存泄漏；
+  快应用侧亦应有 fetch 超时兜底。
+
+#### 时序示意（`chunkCount=5, W=4`）
+
+```
+插件                                     快应用
+ |-- fetch (header, ack:true) ----------->|  建缓冲, ack 模式
+ |-- fetch-chunk seq=0 ------------------>|  收0 → 回 ack=1
+ |-- fetch-chunk seq=1 ------------------>|  收1 → 回 ack=2
+ |-- fetch-chunk seq=2 ------------------>|  收2 → 回 ack=3
+ |-- fetch-chunk seq=3 ------------------>|  收3 → 回 ack=4
+ |<-- fetch-ack ack=1 --------------------|
+ |-- fetch-chunk seq=4 ------------------>|  (窗口随每个 ack 前移)
+ |<-- fetch-ack ack=2 --------------------|
+ |<-- fetch-ack ack=3 --------------------|
+ |<-- fetch-ack ack=4 --------------------|  收4 → 回 ack=5 (=chunkCount)
+ |<-- fetch-ack ack=5 --------------------|  插件：base≥chunkCount ⇒ 完成
+```
+
+> **对快应用的硬性要求**：必须**增量**回 ACK（每收到一个分片就回一次，或至少每 ⌈W/2⌉ 个回一次）。
+> 若实现成「收齐全部才回一个 ACK」，当 `chunkCount > W` 时窗口会在第 `W` 个分片后停住，
+> 再次死锁。增量 ACK 是 ACK 流控不死锁的前提。
 
 ### 5.3 错误响应
 
@@ -315,19 +419,22 @@ original bytes  --(raw ? keep : UTF-8 decode)--> 最终 body
 
 ## 7. 向后兼容性矩阵
 
-| 插件 \ 快应用 | v1 (无 caps)         | v2 (caps.chunk=true，无 encodings) | v3 (full caps)                |
-| ------------- | -------------------- | -------------------------------- | ----------------------------- |
-| v1            | 单消息 `text`/`base64` | 单消息（v1 忽略 caps）              | 单消息（v1 忽略 caps）            |
-| v2            | 单消息（保持 v1）       | 单消息 / 分片 base64               | 单消息 / 分片 base64（v2 不识别 encodings） |
-| **v3 (本仓库)** | 单消息 `text`/`base64` | 单消息 base64 / 分片 base64        | 协商编码 + 协商压缩 + 自动分片   |
+| 插件 \ 快应用 | v1 (无 caps)         | v2 (caps.chunk=true，无 encodings) | v3 (无 ack)                | v3 (含 ack:true)               |
+| ------------- | -------------------- | -------------------------------- | -------------------------- | ----------------------------- |
+| v1            | 单消息 `text`/`base64` | 单消息（v1 忽略 caps）              | 单消息（v1 忽略 caps）        | 单消息（v1 忽略 caps）           |
+| v2            | 单消息（保持 v1）       | 单消息 / 分片 base64               | 单消息 / 分片 base64         | 单消息 / 分片 base64（v2 不识别 ack） |
+| **v3 (本仓库)** | 单消息 `text`/`base64` | 单消息 base64 / 分片 base64（无流控） | 协商编码+压缩 / 分片（无流控） | 协商编码+压缩 / **分片 + 滑动窗口 ACK 流控** |
+
+> 注意「v3 (无 ack)」一列：快应用即便声明了 v3 的 `encodings`/`compressions`，只要没置 `ack:true`，
+> 分片仍走 v2 式无流控发送——大文件仍有死锁风险。要彻底消除死锁，**必须**声明 `ack:true`（见 §5.2.1）。
 
 只要快应用对响应做到：
-1. 先看 `resp.chunked` 决定是否等 chunk；
+1. 先看 `resp.chunked` 决定是否等 chunk；**若 `resp.ack` 为 `true`，每收到一片就回送 `fetch-ack`（§5.2.1）**；
 2. 先看 `resp.bodyEncoding` 决定如何把 `body`/`data` 解码成字节；
 3. 再看 `resp.compression` 决定是否解压；
 4. 最后看 `resp.raw` 决定是否 UTF-8 解码；
 
-就能同时兼容 v1、v2、v3 三种插件。
+就能同时兼容 v1、v2、v3 三种插件（不回 ACK 也不会报错，只是退回无流控分片）。
 
 ---
 
@@ -370,6 +477,7 @@ import { decompress as lz4Decompress } from 'lz4js'; // 用于 lz4 解压
 const HS_TAG          = '__hs__';
 const FETCH_TAG       = 'fetch';
 const FETCH_CHUNK_TAG = 'fetch-chunk';
+const FETCH_ACK_TAG   = 'fetch-ack';
 
 // ---- 本端能力声明 ----
 // 按偏好顺序排列：第一个是最希望对端使用的。
@@ -381,11 +489,16 @@ const LOCAL_CAPS = {
   encodings:   ['hex', 'base64'],
   // 想完全省 CPU 就只写 ['none']；要省带宽用 ['deflate','lz4','none']。
   compressions: ['lz4', 'none'],
+  // 声明会回送 fetch-ack（启用滑动窗口流控，避免大文件分片把通道灌死）。
+  // ackWindow 是希望的在途分片数；插件会与自身上限取 min。省略则用插件默认。
+  ack: true,
+  ackWindow: 4,
 };
 
 // ---- 内部状态 ----
 let nextReqId = 1;
-const pending = new Map();      // id -> { resolve, reject, header, chunks, received }
+// id -> { resolve, reject, header, chunks, received, ackPaced, ackedUpto }
+const pending = new Map();
 let negotiated = { version: 1, chunked: false, chunkSize: 0, encodings: [], compressions: [] };
 
 // ---- 解码器 ----
@@ -533,22 +646,44 @@ function handleFetchHeader(msg) {
   }
 
   // 分片模式：暂存头部，等待 fetch-chunk
-  slot.header  = resp;
-  slot.chunks  = new Array(resp.chunkCount);
+  slot.header   = resp;
+  slot.chunks   = new Array(resp.chunkCount);
   slot.received = 0;
+  // resp.ack === true 时插件启用了滑动窗口流控，我们必须增量回送 fetch-ack。
+  slot.ackPaced  = resp.ack === true;
+  slot.ackedUpto = 0;          // 当前连续前沿（= 下一个仍缺失的 seq）
+}
+
+// 回送累计 ACK：ack = 已按序连续收到的分片数（= 下一个仍缺失的 seq）。
+function sendAck(id, ack) {
+  const msg = { tag: FETCH_ACK_TAG, ack };
+  if (id !== undefined) msg.id = id;
+  transport.send(JSON.stringify(msg));
 }
 
 function handleFetchChunk(msg) {
   const slot = pending.get(msg.id);
   if (!slot || !slot.header) return;
   const seq = msg.seq | 0;
-  if (slot.chunks[seq]) return; // 重复，忽略
+  if (slot.chunks[seq]) {
+    // 重复分片（多半是 go-back-N 重传）。数据忽略，但仍要回当前 ACK，
+    // 好让发送方知道我们的连续前沿，避免它继续停滞。
+    if (slot.ackPaced) sendAck(msg.id, slot.ackedUpto);
+    return;
+  }
   try {
     slot.chunks[seq] = decodeBody(msg.data || '', slot.header.bodyEncoding || 'base64');
   } catch (err) {
     slot.reject(err); pending.delete(msg.id); return;
   }
   slot.received += 1;
+
+  if (slot.ackPaced) {
+    // 推进连续前沿：从当前 ackedUpto 起，把所有已落位的分片走完。
+    while (slot.chunks[slot.ackedUpto]) slot.ackedUpto += 1;
+    sendAck(msg.id, slot.ackedUpto);
+  }
+
   if (slot.received >= slot.header.chunkCount) finalizePending(msg.id);
 }
 
@@ -612,6 +747,8 @@ const LOCAL_CAPS = {
   maxChunkSize: 2048,
   encodings:    ['hex'],           // 只能 hex
   compressions: ['none'],          // 不解压
+  ack: true,                       // 仍要开 ACK 流控，否则大文件分片可能灌死通道
+  ackWindow: 2,                    // RAM 紧张 ⇒ 在途分片更少
 };
 
 // 带宽极差但 CPU 够：deflate 优先
@@ -621,8 +758,14 @@ const LOCAL_CAPS = {
   maxChunkSize: 8192,
   encodings:    ['base64', 'hex'],
   compressions: ['deflate', 'lz4', 'none'],
+  ack: true,
+  ackWindow: 8,                    // RAM/带宽充裕 ⇒ 更大窗口、更高吞吐
 };
 ```
+
+> **强烈建议任何会接收大响应的快应用都置 `ack: true`**：这是分片不死锁的根本保证。
+> 省略 `ack` 只会退回 v2 无流控分片——小响应能用，大响应有撑爆通道的风险。
+> 启用后唯一的额外成本就是 §8.1 里那几行 `sendAck`（收到分片即回一个累计序号）。
 
 ### 8.4 最小集成（仅 v1，不分片不压缩）
 
@@ -638,26 +781,34 @@ const LOCAL_CAPS = {
 
 修改本协议时，参考以下源文件：
 
-- `src/codec.rs:14-66` — `BodyEncoding` / `Compression` 枚举与 `parse` / `as_str`。
-- `src/codec.rs:71-92` — `SUPPORTED_ENCODINGS` / `SUPPORTED_COMPRESSIONS` / `COMPRESS_MIN_SIZE` 常量。
-- `src/codec.rs:94-117` — `compress(data, algo)` 与 `encode(data, encoding)`。
-- `src/handshake.rs:19-30` — 常量 `LOCAL_PROTOCOL_VERSION / LOCAL_MAX_CHUNK_SIZE / MIN_CHUNK_SIZE`。
-- `src/handshake.rs:65-87` — `PeerCaps` / `NegotiatedCaps` 数据结构。
-- `src/handshake.rs:124-145` — `negotiated_caps(addr, pkg)` / `negotiated_chunk_size`，分片与编码的唯一查询点。
-- `src/handshake.rs:148-200` — `handle_packet`、`parse_caps`、`negotiate` 协商主流程。
-- `src/handshake.rs:265-281` — `local_caps_value`，对外声明本端能力。
-- `src/fetch.rs:13-17` — `FETCH_TAG` / `FETCH_CHUNK_TAG` 常量。
-- `src/fetch.rs:165-211` — `build_plan` / `pick_compression` / `pick_encoding`：响应编码策略入口。
-- `src/fetch.rs:226-321` — `send_unchunked` / `send_chunked` 的 wire 字段写出顺序。
+- `src/codec.rs:13-72` — `BodyEncoding` / `Compression` 枚举与 `parse` / `as_str`。
+- `src/codec.rs:76-92` — `SUPPORTED_ENCODINGS` / `SUPPORTED_COMPRESSIONS` / `COMPRESS_MIN_SIZE` 常量。
+- `src/codec.rs:94-125` — `compress(data, algo)` 与 `encode(data, encoding)`。
+- `src/handshake.rs:22-45` — 常量 `LOCAL_PROTOCOL_VERSION / LOCAL_MAX_CHUNK_SIZE / MIN_CHUNK_SIZE` 与 ACK 流控的 `LOCAL_ACK_SUPPORTED / DEFAULT_ACK_WINDOW / MIN_ACK_WINDOW / MAX_ACK_WINDOW`。
+- `src/handshake.rs:80-106` — `PeerCaps` / `NegotiatedCaps` 数据结构（含 `ack` / `ack_window`）。
+- `src/handshake.rs:156-178` — `negotiated_caps(addr, pkg)`，分片/编码/`ack_window` 的唯一查询点。
+- `src/handshake.rs:183-250` — `handle_packet`、`parse_caps`、`negotiate` 协商主流程。
+- `src/handshake.rs:340-352` — `local_caps_value`，对外声明本端能力（含 `ack` / `ackWindow`）。
+- `src/fetch.rs:14-23` — `FETCH_TAG` / `FETCH_CHUNK_TAG` / `FETCH_ACK_TAG` 常量。
+- `src/fetch.rs:186-216` — `build_plan` / `pick_compression` / `pick_encoding`：响应编码与 `ack_window` 决策入口。
+- `src/fetch.rs:289-455` — `send_unchunked` / `send_chunked`（含 `ack:true` 头部标志与 ACK/无流控分支）/ `handle_ack`。
+- `src/transfer.rs` — **ACK 流控状态机**：在途分片注册表、滑动窗口 `pump`、`begin`（首批发送）、`on_ack`（推进窗口/go-back-N 重传/完成清理）。死锁修复的核心。
+- `src/lib.rs:dispatch_interconnect` — `fetch-ack` tag 的分发入口（仅推进窗口，不触发 UI 重渲染）。
 
 兼容性硬性约束：
 
-1. **永远先发头部消息**：分片模式下 `tag:"fetch"` 头部必须先于任何 `fetch-chunk` 出门。
+1. **永远先发头部消息**：分片模式下 `tag:"fetch"` 头部（含 `ack` 标志）必须先于任何 `fetch-chunk` 出门。
 2. **不要重命名/重排** `resp.{ok,status,statusText,headers,body,raw}` 六个 v1 字段。
 3. **未知字段必须可被旧端忽略**：所有 v2/v3 新增字段都是可选元信息；对没声明 `caps` 的对端，
-   插件**禁止**输出 `chunked` / `bodyEncoding != legacy` / `compression != none`。
+   插件**禁止**输出 `chunked` / `bodyEncoding != legacy` / `compression != none` / `ack`。
 4. **`base64` 必须永远在 `SUPPORTED_ENCODINGS` 里**：它是兜底通用编码，任何对端都假定能解码。
 5. **`none` 必须永远在 `SUPPORTED_COMPRESSIONS` 里**：是默认无压缩选项。
 6. **`chunkSize` 必有下限**（当前 `MIN_CHUNK_SIZE=256`），避免恶意/异常 peer 让我们发出几万个微帧。
 7. **`COMPRESS_MIN_SIZE` 阈值之下不压缩**：避免短包压缩反而膨胀。
 8. 修改默认 `LOCAL_MAX_CHUNK_SIZE` 时要同时评估 QAIC 单帧上限 + 编码膨胀（hex 2×）+ JSON 外壳长度。
+9. **ACK 流控只在 `negotiated.ackWindow > 0` 时启用**（即双方都声明 `ack`）；否则分片必须走无流控老路，
+   绝不能等待一个永远不会来的 `fetch-ack`。`ackWindow` 必有上下限（`[1, 64]`）：下限防瞬间停滞，上限防退化回无界 blast。
+10. **发送分片绝不持有发送状态锁**：`transfer.rs` 在锁内只挑选要发的分片，释放锁后再做阻塞式 `send_qaic_message`，
+    避免阻塞期间的重入把同一把锁锁死——这正是当初死锁的同类陷阱。
+11. **不要在一次 `on_event` 里同步发完所有分片**：ACK 流控每批最多发 `window` 个就返回，靠后续 `fetch-ack`
+    续传，从而把控制权交还宿主让传输排空。回退到无界 blast 会重新引入死锁。
