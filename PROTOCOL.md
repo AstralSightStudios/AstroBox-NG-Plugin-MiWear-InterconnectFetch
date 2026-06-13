@@ -17,10 +17,12 @@
 
 **兼容承诺**：
 
-- v3 插件对未带 `caps` 或仅声明 v1/v2 能力的快应用，行为与对应版本**完全一致**。
+- v3 插件对未带 `caps` 或仅声明 v1/v2 能力的快应用，响应格式保持对应版本兼容。
 - v3 插件对 v3 快应用，按双方共同支持的能力交集 + 对端偏好顺序选择编码/压缩。
 - 任何 v3 快应用都必须保留对 v1 单消息 `base64`/`text` 响应的处理能力——
   这是首响应到达前协商尚未完成时的兜底路径。
+- 为保护 AstroBox UI 与 QAIC/BLE 传输，插件会拒绝超过 `MAX_UNCHUNKED_WIRE_LEN`
+  的 legacy 单消息响应；大图/长响应必须先完成 `chunk=true` 协商后走分片。
 
 ### ⚠️ 关于分片死锁 (v2 → v3 的关键修复)
 
@@ -153,6 +155,9 @@ LOCAL_ACK_SUPPORTED      = true
 DEFAULT_ACK_WINDOW       = 4      chunks // 默认在途分片数
 MIN_ACK_WINDOW           = 1      chunks
 MAX_ACK_WINDOW           = 64     chunks
+
+SESSION_IDLE_TIMEOUT     = 600    seconds // 握手/请求/ACK 任意活动都会刷新
+MAX_UNCHUNKED_WIRE_LEN   = 16384  chars   // legacy 单消息响应体编码字符串上限
 ```
 
 - 任意一端未声明 `caps` ⇒ 全部走 v1 路径（单消息、`text`/`base64`、不压缩、不分片、无 ACK）。
@@ -161,6 +166,10 @@ MAX_ACK_WINDOW           = 64     chunks
 - `encodings`/`compressions` 缺失或交集为空 ⇒ 走 v1/v2 baseline 默认值。
 - 快应用 `ack` 缺失或为 `false` ⇒ `ackWindow=0` ⇒ 分片走 v2 无流控路径（一次性发完所有分片）。
   **只有快应用显式声明 `ack:true`，本插件才会启用滑动窗口并等待 `fetch-ack`。**
+- 已协商能力是会话状态，不是 3 秒内的一次性握手状态。插件在收到 `__hs__`、`fetch` 请求、
+  `fetch-ack` 时都会刷新会话活跃时间；只有连续空闲超过 `SESSION_IDLE_TIMEOUT` 后才丢弃。
+- 如果快应用在没有有效协商状态时直接请求大图，插件只能按 legacy 单消息兜底；当编码后的
+  单消息体超过 `MAX_UNCHUNKED_WIRE_LEN` 时会返回错误，避免把整张图塞进一帧导致 UI/传输卡死。
 
 ---
 
@@ -191,6 +200,10 @@ MAX_ACK_WINDOW           = 64     chunks
 
 > v3 当前**未对请求体引入压缩/分片**——上行请求通常很小、且来自更弱的设备。
 > 若未来扩展，将在 `options` 里加 `bodyEncoding` / `bodyCompression` 字段，同样向后兼容。
+
+> 大图请求前，快应用应先完成 `__hs__` 能力协商，并声明 `chunk:true`；若要避免大响应死锁，
+> 还必须声明 `ack:true` 并按 §5.2.1 增量回 ACK。插件收到 fetch 时会主动保活/补发握手，
+> 但同一次 `on_event` 内无法等待快应用的握手回包再重算响应计划。
 
 ---
 
@@ -235,6 +248,10 @@ encoded string  --(bodyEncoding decode)-->  payload bytes
 payload bytes   --(compression decompress)-->  original bytes
 original bytes  --(raw ? keep : UTF-8 decode)--> 最终 body
 ```
+
+**单消息保护线**：当插件没有可用分片协商，且编码后的 `body` 字符串超过
+`MAX_UNCHUNKED_WIRE_LEN` 时，插件不会发送该大包，而是返回 §5.3 的错误响应。这样会让调用方
+快速失败并重新握手/重试，避免单个超大 `fetch` 帧阻塞 AstroBox UI 或 QAIC 发送队列。
 
 ### 5.2 分片模式
 
@@ -354,6 +371,8 @@ original bytes  --(raw ? keep : UTF-8 decode)--> 最终 body
   由于对端乱序缓存，补齐空洞后 `ack` 即跳过已缓存分片。
 - **超时清理**：若某传输长时间（实现取 30s）无任何 ACK，发送方丢弃其发送状态以防内存泄漏；
   快应用侧亦应有 fetch 超时兜底。
+- **会话保活**：每个 `fetch-ack` 同时刷新握手会话活跃时间，避免长图传输期间协商能力过期。
+  这保证下一次图片请求仍能沿用 `chunk/ack` 能力，而不是退回 legacy 单消息路径。
 
 #### 时序示意（`chunkCount=5, W=4`）
 
@@ -784,14 +803,14 @@ const LOCAL_CAPS = {
 - `src/codec.rs:13-72` — `BodyEncoding` / `Compression` 枚举与 `parse` / `as_str`。
 - `src/codec.rs:76-92` — `SUPPORTED_ENCODINGS` / `SUPPORTED_COMPRESSIONS` / `COMPRESS_MIN_SIZE` 常量。
 - `src/codec.rs:94-125` — `compress(data, algo)` 与 `encode(data, encoding)`。
-- `src/handshake.rs:22-45` — 常量 `LOCAL_PROTOCOL_VERSION / LOCAL_MAX_CHUNK_SIZE / MIN_CHUNK_SIZE` 与 ACK 流控的 `LOCAL_ACK_SUPPORTED / DEFAULT_ACK_WINDOW / MIN_ACK_WINDOW / MAX_ACK_WINDOW`。
+- `src/handshake.rs:16-49` — 常量 `SESSION_IDLE_TIMEOUT / LOCAL_PROTOCOL_VERSION / LOCAL_MAX_CHUNK_SIZE / MIN_CHUNK_SIZE` 与 ACK 流控的 `LOCAL_ACK_SUPPORTED / DEFAULT_ACK_WINDOW / MIN_ACK_WINDOW / MAX_ACK_WINDOW`。
 - `src/handshake.rs:80-106` — `PeerCaps` / `NegotiatedCaps` 数据结构（含 `ack` / `ack_window`）。
-- `src/handshake.rs:156-178` — `negotiated_caps(addr, pkg)`，分片/编码/`ack_window` 的唯一查询点。
-- `src/handshake.rs:183-250` — `handle_packet`、`parse_caps`、`negotiate` 协商主流程。
-- `src/handshake.rs:340-352` — `local_caps_value`，对外声明本端能力（含 `ack` / `ackWindow`）。
-- `src/fetch.rs:14-23` — `FETCH_TAG` / `FETCH_CHUNK_TAG` / `FETCH_ACK_TAG` 常量。
+- `src/handshake.rs:153-200` — `is_open` / `record_activity` / `negotiated_caps(addr, pkg)`，会话保活与分片/编码/`ack_window` 的唯一查询点。
+- `src/handshake.rs:202-278` — `handle_packet`、`ensure_open`、`parse_caps`、`negotiate` 协商主流程。
+- `src/handshake.rs:368-380` — `local_caps_value`，对外声明本端能力（含 `ack` / `ackWindow`）。
+- `src/fetch.rs:14-28` — `FETCH_TAG` / `FETCH_CHUNK_TAG` / `FETCH_ACK_TAG` / `MAX_UNCHUNKED_WIRE_LEN` 常量。
 - `src/fetch.rs:186-216` — `build_plan` / `pick_compression` / `pick_encoding`：响应编码与 `ack_window` 决策入口。
-- `src/fetch.rs:289-455` — `send_unchunked` / `send_chunked`（含 `ack:true` 头部标志与 ACK/无流控分支）/ `handle_ack`。
+- `src/fetch.rs:293-477` — `send_unchunked` / `send_chunked`（含 `ack:true` 头部标志与 ACK/无流控分支）/ `handle_ack`。
 - `src/transfer.rs` — **ACK 流控状态机**：在途分片注册表、滑动窗口 `pump`、`begin`（首批发送）、`on_ack`（推进窗口/go-back-N 重传/完成清理）。死锁修复的核心。
 - `src/lib.rs:dispatch_interconnect` — `fetch-ack` tag 的分发入口（仅推进窗口，不触发 UI 重渲染）。
 
@@ -812,3 +831,7 @@ const LOCAL_CAPS = {
     避免阻塞期间的重入把同一把锁锁死——这正是当初死锁的同类陷阱。
 11. **不要在一次 `on_event` 里同步发完所有分片**：ACK 流控每批最多发 `window` 个就返回，靠后续 `fetch-ack`
     续传，从而把控制权交还宿主让传输排空。回退到无界 blast 会重新引入死锁。
+12. **不要把超大响应退回 legacy 单消息**：缺失协商时，`send_unchunked` 必须用 `MAX_UNCHUNKED_WIRE_LEN`
+    拦截大包并返回错误；否则一次错误的能力过期就会重新把整张图片塞进 `tag:"fetch"`。
+13. **长传输必须刷新会话活跃时间**：`fetch` 请求和 `fetch-ack` 都要调用握手保活逻辑，避免图片分片
+    还在正常推进时协商能力被误判过期。

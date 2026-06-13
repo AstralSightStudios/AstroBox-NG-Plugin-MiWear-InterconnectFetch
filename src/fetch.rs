@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use waki::{Client, Method};
 
-use crate::codec::{self, BodyEncoding, COMPRESS_MIN_SIZE, Compression};
+use crate::codec::{self, BodyEncoding, Compression, COMPRESS_MIN_SIZE};
 use crate::handshake::{self, NegotiatedCaps};
 use crate::interconnect;
 use crate::state;
@@ -21,6 +21,11 @@ pub const FETCH_CHUNK_TAG: &str = "fetch-chunk";
 /// peer still needs. Drives the sliding window in `transfer.rs`. Only seen when
 /// both sides negotiated `caps.ack`.
 pub const FETCH_ACK_TAG: &str = "fetch-ack";
+/// Last-resort guard for legacy single-message responses. If negotiated caps
+/// are missing, large binary responses would otherwise become one huge JSON
+/// `fetch` frame and can wedge the host UI / QAIC transport. Normal large
+/// responses must use negotiated chunking instead.
+const MAX_UNCHUNKED_WIRE_LEN: usize = 16 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct FetchRequest {
@@ -67,6 +72,7 @@ pub fn handle_request(addr: &str, pkg: &str, body: Value) {
     let id = req.id.clone();
     let url = req.url.clone();
     state::record_request(pkg, addr, Some(&url));
+    handshake::ensure_open(addr, pkg);
 
     let options = req.options.unwrap_or_default();
     let method = options
@@ -87,8 +93,11 @@ pub fn handle_request(addr: &str, pkg: &str, body: Value) {
 
     match perform_request(&method, &url, options.headers, options.body, raw_mode) {
         Ok(resp) => {
-            state::record_result(pkg, true, Some(format!("HTTP {}", resp.status)));
-            send_response(addr, pkg, id.as_deref(), resp);
+            let status = resp.status;
+            match send_response(addr, pkg, id.as_deref(), resp) {
+                Ok(()) => state::record_result(pkg, true, Some(format!("HTTP {}", status))),
+                Err(err) => state::record_result(pkg, false, Some(err)),
+            }
         }
         Err(err) => {
             tracing::error!("fetch error: {err}");
@@ -96,8 +105,6 @@ pub fn handle_request(addr: &str, pkg: &str, body: Value) {
             send_error(addr, pkg, id.as_deref(), &err);
         }
     }
-
-    handshake::ensure_open(addr, pkg);
 }
 
 fn perform_request(
@@ -218,7 +225,9 @@ fn build_plan(resp: &FetchResponse, caps: Option<&NegotiatedCaps>) -> TransferPl
 /// didn't advertise a list (v1/v2 baseline) or the body is too small to be
 /// worth compressing.
 fn pick_compression(caps: Option<&NegotiatedCaps>, body_len: usize) -> Compression {
-    let Some(caps) = caps else { return Compression::None };
+    let Some(caps) = caps else {
+        return Compression::None;
+    };
     if caps.compressions.is_empty() || body_len < COMPRESS_MIN_SIZE {
         return Compression::None;
     }
@@ -246,8 +255,10 @@ fn pick_encoding(
     will_chunk: bool,
     compression: Compression,
 ) -> BodyEncoding {
-    let text_viable =
-        !will_chunk && !raw && compression == Compression::None && std::str::from_utf8(payload).is_ok();
+    let text_viable = !will_chunk
+        && !raw
+        && compression == Compression::None
+        && std::str::from_utf8(payload).is_ok();
 
     let peer_encs = caps.map(|c| c.encodings.as_slice()).unwrap_or(&[]);
 
@@ -274,14 +285,22 @@ fn pick_encoding(
     BodyEncoding::Base64
 }
 
-fn send_response(addr: &str, pkg: &str, id: Option<&str>, resp: FetchResponse) {
+fn send_response(
+    addr: &str,
+    pkg: &str,
+    id: Option<&str>,
+    resp: FetchResponse,
+) -> Result<(), String> {
     let caps = handshake::negotiated_caps(addr, pkg);
     let plan = build_plan(&resp, caps.as_ref());
 
     // `chunk_size` is `Copy`, so matching on it doesn't borrow `plan` — the
     // chunked arm can take ownership and hand the payload off to `transfer`.
     match plan.chunk_size {
-        Some(cs) => send_chunked(addr, pkg, id, &resp, plan, cs),
+        Some(cs) => {
+            send_chunked(addr, pkg, id, &resp, plan, cs);
+            Ok(())
+        }
         None => send_unchunked(addr, pkg, id, &resp, &plan),
     }
 }
@@ -292,11 +311,28 @@ fn send_unchunked(
     id: Option<&str>,
     resp: &FetchResponse,
     plan: &TransferPlan,
-) {
+) -> Result<(), String> {
     // Encoding `Text` can't fail at this point: pick_encoding only returns it
     // when the payload was checked to be valid UTF-8 and not compressed.
     let encoded = codec::encode(&plan.payload, plan.encoding)
         .unwrap_or_else(|_| codec::encode(&plan.payload, BodyEncoding::Base64).unwrap());
+
+    if encoded.len() > MAX_UNCHUNKED_WIRE_LEN {
+        tracing::error!(
+            "refusing oversized unchunked fetch response: pkg={} addr={} id={} encoded={} original={} enc={} comp={}",
+            pkg,
+            addr,
+            id.unwrap_or(""),
+            encoded.len(),
+            plan.original_bytes,
+            plan.encoding.as_str(),
+            plan.compression.as_str(),
+        );
+        let message =
+            "response too large for unchunked interconnect frame; complete FetchBridge handshake with chunk=true";
+        send_error(addr, pkg, id, message);
+        return Err(message.to_string());
+    }
 
     let mut resp_obj = Map::new();
     resp_obj.insert("ok".into(), Value::Bool(resp.ok));
@@ -323,7 +359,13 @@ fn send_unchunked(
         resp_obj.insert("originalBytes".into(), Value::from(plan.original_bytes));
     }
 
-    interconnect::send_json(addr, pkg, FETCH_TAG, wrap_with_id(id, "resp", Value::Object(resp_obj)));
+    interconnect::send_json(
+        addr,
+        pkg,
+        FETCH_TAG,
+        wrap_with_id(id, "resp", Value::Object(resp_obj)),
+    );
+    Ok(())
 }
 
 fn send_chunked(
@@ -386,7 +428,12 @@ fn send_chunked(
     if ack_paced {
         resp_obj.insert("ack".into(), Value::Bool(true));
     }
-    interconnect::send_json(addr, pkg, FETCH_TAG, wrap_with_id(id, "resp", Value::Object(resp_obj)));
+    interconnect::send_json(
+        addr,
+        pkg,
+        FETCH_TAG,
+        wrap_with_id(id, "resp", Value::Object(resp_obj)),
+    );
 
     // Header is out (compat rule #1). Now ship the body.
     if ack_paced {
@@ -427,6 +474,7 @@ fn send_chunked(
 /// contiguous chunk index the peer still needs. Drives the sliding window so
 /// the next batch of chunks goes out (see `transfer::on_ack`).
 pub fn handle_ack(addr: &str, pkg: &str, body: Value) {
+    handshake::record_activity(addr, pkg);
     let id = body.get("id").and_then(|v| v.as_str());
     let ack = body.get("ack").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     tracing::debug!(

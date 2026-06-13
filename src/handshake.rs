@@ -4,16 +4,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
-use crate::codec::{
-    BodyEncoding, Compression, SUPPORTED_COMPRESSIONS, SUPPORTED_ENCODINGS,
-};
+use crate::codec::{BodyEncoding, Compression, SUPPORTED_COMPRESSIONS, SUPPORTED_ENCODINGS};
 use crate::interconnect;
 
 /// Reserved tag used by the original interconn-fetch handshake protocol.
 pub const HS_TAG: &str = "__hs__";
-const HS_TIMEOUT: Duration = Duration::from_millis(3000);
+/// How long negotiated peer capabilities remain valid without any protocol
+/// activity. This must be much longer than one image transfer: ACK-paced
+/// chunking can keep the peer busy for minutes, and expiring caps mid-session
+/// makes the next large response fall back to the unsafe v1 single-frame path.
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Protocol version we advertise.
 ///   v1 — legacy single-message fetch (base64 + no compression).
@@ -56,7 +58,8 @@ struct Session {
     /// `true` when we believe the QuickApp is in the "open" state and is
     /// allowed to send work.
     open: bool,
-    /// Last time we exchanged a handshake packet with this peer.
+    /// Last time this peer showed any protocol activity (handshake, fetch
+    /// request, or fetch ACK).
     last_seen: Instant,
     /// Negotiated capabilities, populated once the peer has advertised its
     /// own `caps`. `None` means the peer hasn't told us anything yet, so we
@@ -126,9 +129,13 @@ fn touch(addr: &str, pkg: &str, open: Option<bool>, caps: Option<NegotiatedCaps>
     let now = Instant::now();
     let key = (addr.to_string(), pkg.to_string());
 
-    // Drop any session that timed out so a stale "open" flag doesn't trick
-    // later requests into thinking the peer is still talking to us.
-    guard.sessions.retain(|_, s| now.duration_since(s.last_seen) <= HS_TIMEOUT);
+    // Drop sessions that went idle for a long time so a stale "open" flag
+    // doesn't live forever. The timeout is intentionally not a short handshake
+    // timeout; negotiated capabilities are session properties and must survive
+    // normal fetch/ACK traffic.
+    guard
+        .sessions
+        .retain(|_, s| now.duration_since(s.last_seen) <= SESSION_IDLE_TIMEOUT);
 
     let session = guard.sessions.entry(key).or_insert_with(Session::default);
     session.last_seen = now;
@@ -146,8 +153,26 @@ pub fn is_open(addr: &str, pkg: &str) -> bool {
     guard
         .sessions
         .get(&(addr.to_string(), pkg.to_string()))
-        .map(|s| s.open && s.last_seen.elapsed() <= HS_TIMEOUT)
+        .map(|s| s.open && s.last_seen.elapsed() <= SESSION_IDLE_TIMEOUT)
         .unwrap_or(false)
+}
+
+/// Record non-handshake peer activity. A fetch request or ACK means the peer is
+/// still alive, so negotiated capabilities should not expire just because no
+/// `__hs__` packet was exchanged during a long transfer.
+pub fn record_activity(addr: &str, pkg: &str) {
+    let mut guard = state().lock().unwrap_or_else(|p| p.into_inner());
+    let now = Instant::now();
+    let key = (addr.to_string(), pkg.to_string());
+
+    guard
+        .sessions
+        .retain(|_, s| now.duration_since(s.last_seen) <= SESSION_IDLE_TIMEOUT);
+
+    if let Some(session) = guard.sessions.get_mut(&key) {
+        session.last_seen = now;
+        session.open = true;
+    }
 }
 
 /// Look up the negotiated capabilities for this peer. Returns `None` when no
@@ -156,7 +181,7 @@ pub fn is_open(addr: &str, pkg: &str) -> bool {
 pub fn negotiated_caps(addr: &str, pkg: &str) -> Option<NegotiatedCaps> {
     let guard = state().lock().unwrap_or_else(|p| p.into_inner());
     let session = guard.sessions.get(&(addr.to_string(), pkg.to_string()))?;
-    if !session.open || session.last_seen.elapsed() > HS_TIMEOUT {
+    if !session.open || session.last_seen.elapsed() > SESSION_IDLE_TIMEOUT {
         return None;
     }
     session.caps.clone()
@@ -229,6 +254,7 @@ pub fn handle_packet(addr: &str, pkg: &str, packet: &Value) {
 /// quickly in practice; the JS version doesn't actually await the response).
 pub fn ensure_open(addr: &str, pkg: &str) {
     if is_open(addr, pkg) {
+        record_activity(addr, pkg);
         return;
     }
     tracing::info!("handshake bootstrap: addr={} pkg={}", addr, pkg);
@@ -252,14 +278,8 @@ pub fn ensure_open(addr: &str, pkg: &str) {
 fn parse_caps(v: Option<&Value>) -> Option<PeerCaps> {
     let obj = v?.as_object()?;
     Some(PeerCaps {
-        protocol_version: obj
-            .get("version")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1) as u32,
-        chunked: obj
-            .get("chunk")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        protocol_version: obj.get("version").and_then(|v| v.as_u64()).unwrap_or(1) as u32,
+        chunked: obj.get("chunk").and_then(|v| v.as_bool()).unwrap_or(false),
         max_chunk_size: obj
             .get("maxChunkSize")
             .and_then(|v| v.as_u64())
@@ -267,10 +287,7 @@ fn parse_caps(v: Option<&Value>) -> Option<PeerCaps> {
         encodings: parse_string_list(obj.get("encodings"), BodyEncoding::parse),
         compressions: parse_string_list(obj.get("compressions"), Compression::parse),
         ack: obj.get("ack").and_then(|v| v.as_bool()).unwrap_or(false),
-        ack_window: obj
-            .get("ackWindow")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize,
+        ack_window: obj.get("ackWindow").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
     })
 }
 
