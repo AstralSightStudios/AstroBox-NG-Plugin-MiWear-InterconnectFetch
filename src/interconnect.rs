@@ -9,17 +9,22 @@ use crate::state::{self, InstalledApp};
 /// installed apps + re-register). Click-heavy users won't hammer the host.
 const AUTO_REFRESH_THROTTLE_MS: u128 = 1500;
 
-/// AstroBox NG wraps each interconnect-message event payload in a small JSON
-/// envelope before handing it to the plugin's `on_event` (see the ebook plugin
-/// for the canonical extraction logic). The envelope is intentionally minimal
-/// — it does NOT carry the originating `addr` / `pkg_name`, because the host
-/// already filtered dispatch by the registrations the plugin made.
+/// AstroBox NG wraps each interconnect-message event payload in a JSON envelope
+/// before handing it to the plugin's `on_event`:
 ///
-/// We therefore attribute incoming messages to the most-recently-active enabled
-/// package as a best-effort. For the original interconn-fetch use case (a
-/// single QuickApp talking to a single device) that's exact; for the new
-/// multi-package mode it's a heuristic, and the plugin author has to accept
-/// some ambiguity if two QuickApps talk over fetch at the same time.
+/// ```json
+/// { "addr": "...", "pkgName": "...", "payloadHex": "...", "payloadText": "..." }
+/// ```
+///
+/// The host already knows the exact `(addr, pkgName)` the message came from, so
+/// we read both straight off the envelope. That's what lets several QuickApps
+/// talk over fetch at the same time without their messages — or, worse, their
+/// responses — being misattributed to a single package.
+///
+/// The legacy heuristic (most-recently-active enabled package) is kept only as
+/// a fallback for older hosts whose envelope omits these fields, or for raw
+/// payloads that aren't wrapped at all. That path can't disambiguate concurrent
+/// QuickApps, which is exactly the bug the explicit fields fix.
 pub struct ParsedMessage {
     pub addr: String,
     pub pkg_name: String,
@@ -27,9 +32,33 @@ pub struct ParsedMessage {
 }
 
 pub fn parse_message(payload: &str) -> ParsedMessage {
-    let data = extract_payload_text(payload);
-    let pkg_name = guess_pkg_name(&data);
-    let addr = state::first_device_addr_for(&pkg_name).unwrap_or_default();
+    let envelope: Option<Value> = serde_json::from_str(payload).ok();
+
+    let data = envelope
+        .as_ref()
+        .and_then(payload_text_from_envelope)
+        .unwrap_or_else(|| payload.to_string());
+
+    // Prefer the host-supplied package name; only fall back to the heuristic
+    // when the envelope omits it (older host) so we never collapse concurrent
+    // QuickApps onto one package.
+    let pkg_name = envelope
+        .as_ref()
+        .and_then(|v| v.get("pkgName"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| guess_pkg_name(&data));
+
+    // Same for the originating device address — authoritative when present.
+    let addr = envelope
+        .as_ref()
+        .and_then(|v| v.get("addr"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| state::first_device_addr_for(&pkg_name).unwrap_or_default());
+
     ParsedMessage {
         addr,
         pkg_name,
@@ -37,22 +66,21 @@ pub fn parse_message(payload: &str) -> ParsedMessage {
     }
 }
 
-/// Mirrors `extract_payload_text` from the ebook plugin: peel off the host's
-/// `{ "payloadText": "..." }` / `{ "payload": ... }` envelope when present,
-/// otherwise return the payload verbatim.
-fn extract_payload_text(payload: &str) -> String {
-    if let Ok(json) = serde_json::from_str::<Value>(payload) {
-        if let Some(text) = json.get("payloadText").and_then(|v| v.as_str()) {
-            return text.to_string();
-        }
-        if let Some(payload_value) = json.get("payload") {
-            if let Some(text) = payload_value.as_str() {
-                return text.to_string();
-            }
-            return payload_value.to_string();
-        }
+/// Peel the inner message text out of the host envelope: prefer `payloadText`,
+/// fall back to a `payload` field (string or stringified object). Returns
+/// `None` when neither key is present so the caller can use the raw payload
+/// (older hosts / unwrapped messages).
+fn payload_text_from_envelope(json: &Value) -> Option<String> {
+    if let Some(text) = json.get("payloadText").and_then(|v| v.as_str()) {
+        return Some(text.to_string());
     }
-    payload.to_string()
+    if let Some(payload_value) = json.get("payload") {
+        if let Some(text) = payload_value.as_str() {
+            return Some(text.to_string());
+        }
+        return Some(payload_value.to_string());
+    }
+    None
 }
 
 /// Choose which tracked package this message should be attributed to. We
