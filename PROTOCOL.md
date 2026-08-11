@@ -1,6 +1,4 @@
-# 网桥 FetchBridge 协议规范 (v3)
-
-使用 Claude Opus 4.7 xhigh 编写，可能存在细微错误，请视实际情况使用
+# 网桥 FetchBridge 协议规范 (v4)
 
 本协议描述 AstroBox NG 插件 **网桥 FetchBridge** 与运行在小米穿戴设备上的快应用之间，
 通过 QAIC `interconnect` 通道交换 HTTP 请求/响应所使用的消息格式。
@@ -13,12 +11,15 @@
 | ---- | -------- | ----------------------------------------------------------------------------------------- |
 | v1   | 永久兼容 | 握手计数 ping-pong；fetch 单消息响应（文本直传 或 base64）。                              |
 | v2   | 永久兼容 | 在 v1 基础上，握手包加入 `caps` 协商；新增 `fetch-chunk` 分片响应路径。                   |
-| v3   | 当前     | 在 v2 基础上：①握手 `caps` 加入 `encodings` / `compressions` 数组，可协商编码与压缩；②握手 `caps` 加入 `ack` / `ackWindow`，引入**滑动窗口 ACK 流控**（`fetch-ack`），修复大文件分片的死锁问题。 |
+| v3   | 永久兼容 | 在 v2 基础上：①握手 `caps` 加入 `encodings` / `compressions`；②加入 `ack` / `ackWindow` 和 `fetch-ack` 滑动窗口流控。 |
+| v4   | 当前     | 在完整保留 v1-v3 的基础上，新增**开放长度、有限内存**的 HTTP 响应流；支持在线音频/视频、大文件、累计 ACK、逐帧 CRC32、重传、取消、结束和错误帧。 |
 
 **兼容承诺**：
 
-- v3 插件对未带 `caps` 或仅声明 v1/v2 能力的快应用，响应格式保持对应版本兼容。
-- v3 插件对 v3 快应用，按双方共同支持的能力交集 + 对端偏好顺序选择编码/压缩。
+- v4 插件对未带 `caps` 或仅声明 v1/v2/v3 能力的快应用，**严格保持对应旧版本行为**；旧端永远不会收到任何 v4 tag 或字段。
+- v3 的 `fetch-chunk` / `fetch-ack` 格式与状态机冻结并永久兼容。v4 使用独立 tag，不改变旧消息的语义。
+- 只有双方满足 `version>=4 && stream=true && chunk=true && ack=true` 时才启用 v4 流。
+- v4 插件对 v3 快应用仍按双方共同支持的能力交集 + 对端偏好顺序选择编码/压缩。
 - 任何 v3 快应用都必须保留对 v1 单消息 `base64`/`text` 响应的处理能力——
   这是首响应到达前协商尚未完成时的兜底路径。
 - 为保护 AstroBox UI 与 QAIC/BLE 传输，插件会拒绝超过 `MAX_UNCHUNKED_WIRE_LEN`
@@ -53,7 +54,11 @@ v3 用**累计 ACK + 滑动窗口**根治：发送方任一时刻最多让 `wind
 | `__hs__`      | 双向                                              | 握手与能力协商。                           |
 | `fetch`       | 快应用 → 插件 (请求) / 插件 → 快应用 (响应或响应头) | HTTP 调用本体；当响应分片时仅承载头部元信息。 |
 | `fetch-chunk` | 插件 → 快应用                                     | 分片模式下携带响应体的某一分片。             |
-| `fetch-ack`   | 快应用 → 插件                                     | **v3 新增**：分片流控确认，告知插件已连续收到的分片进度，用于推进滑动窗口。 |
+| `fetch-ack`   | 快应用 → 插件                                     | **v3**：有限分片的累计 ACK。 |
+| `fetch-stream` | 插件 → 快应用                                    | **v4**：开放长度流的数据帧或最终帧。 |
+| `fetch-stream-ack` | 快应用 → 插件                                | **v4**：流帧累计 ACK，用于背压与重传。 |
+| `fetch-stream-cancel` | 快应用 → 插件                             | **v4**：主动取消并关闭 HTTP 数据源。 |
+| `fetch-stream-error` | 插件 → 快应用                                | **v4**：HTTP 流读取过程中发生错误。 |
 
 未知 `tag` 应当被对端忽略（仅记日志），不得报错断开会话。
 
@@ -95,6 +100,7 @@ QuickApp                              FetchBridge
 | `compressions` | array\<string\>   | `[]`       | 本端可**解压**的压缩算法集合，**按偏好顺序排列**。                                    |
 | `ack`          | boolean           | `false`    | 本端**是否会为分片响应回送 `fetch-ack`**。仅当快应用置 `true` 时，插件才启用滑动窗口流控；否则退回 v2 无流控分片。 |
 | `ackWindow`    | integer           | 插件默认   | 本端希望的在途分片窗口（单位：分片数）。插件会与自身上限取 `min` 并夹到 `[1, 64]`。缺省/`0` 表示采用插件默认。 |
+| `stream`       | boolean           | `false`    | **v4**：支持开放长度响应流、`fetch-stream-*` 控制帧、CRC32 和取消。必须同时声明 `chunk:true` 与 `ack:true`。 |
 
 `encodings` 取值（详见 §6）：
 
@@ -124,10 +130,12 @@ negotiated.chunkSize     = clamp(min(peer.maxChunkSize || local.maxChunkSize,
                                  MIN_CHUNK_SIZE, local.maxChunkSize)
 negotiated.encodings     = peer.encodings ∩ local.encodings   // 保留 peer 顺序
 negotiated.compressions  = peer.compressions ∩ local.compressions
-negotiated.ackWindow     = (negotiated.chunked && local.ack && peer.ack)
+negotiated.ackWindow     = (version >= 3 && negotiated.chunked && local.ack && peer.ack)
                              ? clamp(peer.ackWindow || DEFAULT_ACK_WINDOW,
                                      MIN_ACK_WINDOW, MAX_ACK_WINDOW)
-                             : 0          // 0 = 不启用 ACK 流控，退回无流控分片
+                             : 0
+negotiated.stream        = version >= 4 && local.stream && peer.stream
+                           && negotiated.chunked && negotiated.ackWindow > 0
 ```
 
 **单次响应的编码/压缩选择**（由发送方按本端策略 + 对端偏好顺序决定）：
@@ -143,7 +151,8 @@ negotiated.ackWindow     = (negotiated.chunked && local.ack && peer.ack)
 **插件当前默认值**：
 
 ```
-LOCAL_PROTOCOL_VERSION   = 3
+LOCAL_PROTOCOL_VERSION   = 4
+LOCAL_STREAM_SUPPORTED   = true
 LOCAL_CHUNK_SUPPORTED    = true
 LOCAL_MAX_CHUNK_SIZE     = 4096   bytes (压缩后)
 MIN_CHUNK_SIZE           = 256    bytes
@@ -184,7 +193,8 @@ MAX_UNCHUNKED_WIRE_LEN   = 16384  chars   // legacy 单消息响应体编码字�
     "method":  "GET",
     "headers": { "Accept": "application/json" },
     "body":    "<请求体字符串>",
-    "raw":     false
+    "raw":     false,
+    "stream":  true
   }
 }
 ```
@@ -197,6 +207,7 @@ MAX_UNCHUNKED_WIRE_LEN   = 16384  chars   // legacy 单消息响应体编码字�
 | `options.headers`   | object            | 否   | 请求头键值表，值为字符串；非字符串会被 `toString` 化。       |
 | `options.body`      | string            | 否   | 请求体。当前只支持字符串；二进制请发 base64 自行约定编码。 |
 | `options.raw`       | boolean           | 否   | `true` 表示要求响应体按字节返回（不做 UTF-8 解码）；缺省 `false`。 |
+| `options.stream`    | boolean           | 否   | **v4**：`true` 强制流式；`false` 强制沿用有限 v1-v3 响应；缺省时对 `audio/*`、`video/*` 或 `Content-Length >= 64 KiB` 自动流式。未协商 v4 时忽略并安全回退旧路径。 |
 
 > v3 当前**未对请求体引入压缩/分片**——上行请求通常很小、且来自更弱的设备。
 > 若未来扩展，将在 `options` 里加 `bodyEncoding` / `bodyCompression` 字段，同样向后兼容。
@@ -416,9 +427,116 @@ original bytes  --(raw ? keep : UTF-8 decode)--> 最终 body
 
 ---
 
-## 6. 编码与压缩方式参考
+## 6. v4 开放长度流
 
-### 6.1 编码 `bodyEncoding`
+v4 流用于在线音频、在线视频和无法安全整体缓冲的大文件。它与 v3 有限分片并存：
+`resp.chunked===true` 仍表示 v2/v3；`resp.stream===true` 才表示 v4。流式请求必须带非空且并发唯一的 `id`。
+
+### 6.1 响应头
+
+头部仍先使用 `tag:"fetch"`，并保留全部 v1 核心字段：
+
+```json
+{
+  "tag": "fetch",
+  "id": "media-1",
+  "resp": {
+    "ok": true,
+    "status": 200,
+    "statusText": "OK",
+    "headers": { "content-type": "audio/mpeg" },
+    "body": "",
+    "raw": true,
+    "stream": true,
+    "chunkSize": 4096,
+    "bodyEncoding": "base64",
+    "compression": "none",
+    "ack": true,
+    "checksum": "crc32",
+    "contentLength": 12345678
+  }
+}
+```
+
+`contentLength` 仅在源站给出有效 `Content-Length` 时存在；直播或 chunked HTTP 响应可以完全未知。
+v4 当前固定逐帧 `compression:"none"`，避免跨帧压缩状态导致随机恢复和有限内存失效。源站自身的
+HTTP 内容编码不会被插件解释，仍按 HTTP 响应字节透传。
+
+### 6.2 数据与结束帧
+
+```json
+{
+  "tag": "fetch-stream",
+  "id": "media-1",
+  "seq": 0,
+  "data": "<base64 或 hex>",
+  "crc32": "9a71bb4c"
+}
+```
+
+- `seq` 从 0 严格递增；接收方可以暂存窗口内乱序帧，但只能按连续序列消费。
+- `crc32` 是**编码前当前帧原始字节**的 IEEE CRC-32，小写 8 位十六进制。校验失败不得推进 ACK。
+- 任一时刻插件只读取并缓存至多 `ackWindow * chunkSize` 的响应体数据（另加小量 JSON 编码临时内存）。
+
+HTTP EOF 使用同一序列中的可靠最终帧表示；最终帧也必须 ACK：
+
+```json
+{
+  "tag": "fetch-stream",
+  "id": "media-1",
+  "seq": 417,
+  "data": "",
+  "crc32": "00000000",
+  "final": true,
+  "totalBytes": 1703936
+}
+```
+
+`totalBytes` 是所有非最终帧解码后的累计字节数。接收方只有在最终帧之前的所有序号连续到齐、
+CRC 全部通过后，才可提交 EOF。
+
+### 6.3 ACK、背压与重传
+
+```json
+{ "tag": "fetch-stream-ack", "id": "media-1", "ack": 12 }
+```
+
+`ack` 与 v3 一样表示“下一个缺失的连续帧序号”，即所有 `seq < ack`（包括可能的最终帧）均已接收。
+发送方只在 ACK 前移后释放对应缓冲并从 HTTP source 再读取恰好足以补满窗口的数据，因此慢速播放端
+会自然向 HTTP 下载端施加背压。重复 ACK 会让发送方对当前未确认窗口执行至多一次 go-back-N 重传；
+ACK 前沿推进后才允许下一次重传。v4 不允许无 ACK 流式发送。
+
+### 6.4 取消、错误与清理
+
+接收方停止播放、seek 到新 URL 或销毁页面时应发送：
+
+```json
+{ "tag": "fetch-stream-cancel", "id": "media-1", "reason": "player closed" }
+```
+
+插件立即删除状态并 drop HTTP response，从而关闭数据源。HTTP body 在头部之后读取失败时，插件发送：
+
+```json
+{ "tag": "fetch-stream-error", "id": "media-1", "message": "read streaming body failed: ..." }
+```
+
+流连续 30 秒未收到 ACK 会被清理。插件每 5 秒通过宿主 Timer 主动执行清理，因此即使此后没有任何
+协议消息，遗留 source 也不会永久占用。迟到的 ACK/cancel 必须静默忽略。
+
+### 6.5 有限内存和兼容硬门控
+
+1. 只有 `version>=4 && stream && chunk && ack` 的共同协商结果才能产生 v4 帧。
+2. v1/v2/v3 peer 不会收到 `resp.stream` 或任何 `fetch-stream-*` tag。
+3. `options.stream:true` 在旧会话中不报协议错误，而是回退到原 v1-v3 有限响应规则。
+4. v4 流不能缺少 `id`；插件返回普通 v1 形态错误，而不会以空 id 建立共享状态。
+5. 每帧先校验 CRC，再推进累计 ACK；最终帧同样占一个序号并受 ACK/重传保护。
+6. 头部永远先于首个数据帧发送。
+
+---
+
+## 7. 编码与压缩方式参考
+
+### 7.1 编码 `bodyEncoding`
 
 | 编码     | 膨胀率 | 解码复杂度       | 适合场景                                        |
 | -------- | ------ | ---------------- | ----------------------------------------------- |
@@ -426,7 +544,7 @@ original bytes  --(raw ? keep : UTF-8 decode)--> 最终 body
 | `base64` | ~1.33× | 查表 + 位移      | 通用二进制（兼容性最好，v1/v2 基线）。           |
 | `hex`    | 2.0×   | 两次查表（极简） | RTOS / 低算力 MCU，宁愿多传一倍字节也要降解码开销。 |
 
-### 6.2 压缩 `compression`
+### 7.2 压缩 `compression`
 
 | 算法      | 压缩率           | 编码 CPU | 解码 CPU       | 内存占用 | 适合场景                                       |
 | --------- | ---------------- | -------- | -------------- | -------- | ---------------------------------------------- |
@@ -436,13 +554,14 @@ original bytes  --(raw ? keep : UTF-8 decode)--> 最终 body
 
 ---
 
-## 7. 向后兼容性矩阵
+## 8. 向后兼容性矩阵
 
-| 插件 \ 快应用 | v1 (无 caps)         | v2 (caps.chunk=true，无 encodings) | v3 (无 ack)                | v3 (含 ack:true)               |
-| ------------- | -------------------- | -------------------------------- | -------------------------- | ----------------------------- |
-| v1            | 单消息 `text`/`base64` | 单消息（v1 忽略 caps）              | 单消息（v1 忽略 caps）        | 单消息（v1 忽略 caps）           |
-| v2            | 单消息（保持 v1）       | 单消息 / 分片 base64               | 单消息 / 分片 base64         | 单消息 / 分片 base64（v2 不识别 ack） |
-| **v3 (本仓库)** | 单消息 `text`/`base64` | 单消息 base64 / 分片 base64（无流控） | 协商编码+压缩 / 分片（无流控） | 协商编码+压缩 / **分片 + 滑动窗口 ACK 流控** |
+| 插件 \\ 快应用 | v1（无 caps） | v2 | v3（ack） | v4（stream+ack） |
+| --- | --- | --- | --- | --- |
+| v1 | v1 单消息 | v1 单消息 | v1 单消息 | v1 单消息 |
+| v2 | v1 单消息 | v2 有限分片 | v2 有限分片 | v2 有限分片 |
+| v3 | v1 单消息 | v2 有限分片 | v3 编码/压缩 + ACK | v3（忽略 stream） |
+| **v4（本仓库）** | **严格 v1** | **严格 v2** | **严格 v3** | 显式协商后使用 v4 有限内存开放流；否则仍为 v3 |
 
 > 注意「v3 (无 ack)」一列：快应用即便声明了 v3 的 `encodings`/`compressions`，只要没置 `ack:true`，
 > 分片仍走 v2 式无流控发送——大文件仍有死锁风险。要彻底消除死锁，**必须**声明 `ack:true`（见 §5.2.1）。
@@ -453,11 +572,11 @@ original bytes  --(raw ? keep : UTF-8 decode)--> 最终 body
 3. 再看 `resp.compression` 决定是否解压；
 4. 最后看 `resp.raw` 决定是否 UTF-8 解码；
 
-就能同时兼容 v1、v2、v3 三种插件（不回 ACK 也不会报错，只是退回无流控分片）。
+就能同时兼容 v1、v2、v3；v4 客户端再按 §6 处理 `resp.stream` 和 `fetch-stream-*`。
 
 ---
 
-## 8. 快应用接入示例
+## 9. 快应用接入示例
 
 下面给出一份**框架无关**的参考实现。`transport` 是一层薄抽象，对接平台 API：
 
@@ -480,7 +599,7 @@ export const transport = {
 };
 ```
 
-### 8.1 客户端核心实现
+### 9.1 客户端核心实现
 
 ```js
 // fetch-bridge-client.js
@@ -497,11 +616,16 @@ const HS_TAG          = '__hs__';
 const FETCH_TAG       = 'fetch';
 const FETCH_CHUNK_TAG = 'fetch-chunk';
 const FETCH_ACK_TAG   = 'fetch-ack';
+const FETCH_STREAM_TAG = 'fetch-stream';
+const FETCH_STREAM_ACK_TAG = 'fetch-stream-ack';
+const FETCH_STREAM_CANCEL_TAG = 'fetch-stream-cancel';
+const FETCH_STREAM_ERROR_TAG = 'fetch-stream-error';
 
 // ---- 本端能力声明 ----
 // 按偏好顺序排列：第一个是最希望对端使用的。
 const LOCAL_CAPS = {
-  version: 3,
+  version: 4,
+  stream: true,
   chunk: true,
   maxChunkSize: 4096,
   // RTOS 手表更喜欢 hex（极简解码）；台式/手机环境改成 ["base64","hex"] 更省带宽。
@@ -649,6 +773,13 @@ function handleFetchHeader(msg) {
   if (!slot) return;
 
   const resp = msg.resp || {};
+  if (resp.stream) {
+    slot.header = resp;
+    slot.streamFrames = new Map();
+    slot.streamNext = 0;
+    slot.streamEnded = false;
+    return;
+  }
   if (!resp.chunked) {
     // 单消息模式：直接解码 + 可能解压
     try {
@@ -706,12 +837,62 @@ function handleFetchChunk(msg) {
   if (slot.received >= slot.header.chunkCount) finalizePending(msg.id);
 }
 
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+  }
+  return ((crc ^ 0xffffffff) >>> 0).toString(16).padStart(8, '0');
+}
+
+function sendStreamAck(id, ack) {
+  transport.send(JSON.stringify({ tag: FETCH_STREAM_ACK_TAG, id, ack }));
+}
+
+function handleFetchStream(msg) {
+  const slot = pending.get(msg.id);
+  if (!slot || !slot.header || !slot.header.stream) return;
+  let bytes;
+  try {
+    bytes = decodeBody(msg.data || '', slot.header.bodyEncoding || 'base64');
+    if (crc32(bytes) !== msg.crc32) throw new Error(`CRC mismatch at stream frame ${msg.seq}`);
+  } catch (err) {
+    slot.reject(err);
+    transport.send(JSON.stringify({ tag: FETCH_STREAM_CANCEL_TAG, id: msg.id, reason: String(err) }));
+    pending.delete(msg.id);
+    return;
+  }
+  if (!slot.streamFrames.has(msg.seq)) slot.streamFrames.set(msg.seq, { bytes, final: msg.final === true });
+  while (slot.streamFrames.has(slot.streamNext)) {
+    const frame = slot.streamFrames.get(slot.streamNext);
+    slot.streamFrames.delete(slot.streamNext++);
+    if (frame.final) {
+      slot.streamEnded = true;
+      slot.resolve(buildResp(slot.header, undefined));
+      pending.delete(msg.id);
+      break;
+    }
+    if (slot.onChunk) slot.onChunk(frame.bytes);
+  }
+  sendStreamAck(msg.id, slot.streamNext);
+}
+
+function handleFetchStreamError(msg) {
+  const slot = pending.get(msg.id);
+  if (!slot) return;
+  slot.reject(new Error(msg.message || 'stream failed'));
+  pending.delete(msg.id);
+}
+
 // ---- 入口：监听所有消息 ----
 transport.onMessage((msg) => {
   switch (msg && msg.tag) {
     case HS_TAG:          handleHandshake(msg); break;
     case FETCH_TAG:       handleFetchHeader(msg); break;
     case FETCH_CHUNK_TAG: handleFetchChunk(msg); break;
+    case FETCH_STREAM_TAG: handleFetchStream(msg); break;
+    case FETCH_STREAM_ERROR_TAG: handleFetchStreamError(msg); break;
     default:              /* 未知 tag：按协议要求忽略 */ break;
   }
 });
@@ -722,16 +903,21 @@ sendHandshake(0);
 // ---- 对外 API ----
 export function fetch(url, options = {}) {
   const id = String(nextReqId++);
+  const { onChunk, ...wireOptions } = options;
   return new Promise((resolve, reject) => {
-    pending.set(id, { resolve, reject });
+    pending.set(id, { resolve, reject, onChunk });
     transport.send(JSON.stringify({
       tag: FETCH_TAG,
       id,
       url,
-      options,
+      options: wireOptions,
     }));
     setTimeout(() => {
       if (pending.has(id)) {
+        const slot = pending.get(id);
+        if (slot && slot.header && slot.header.stream) {
+          transport.send(JSON.stringify({ tag: FETCH_STREAM_CANCEL_TAG, id, reason: 'timeout' }));
+        }
         pending.delete(id);
         reject(new Error('fetch timeout'));
       }
@@ -740,7 +926,7 @@ export function fetch(url, options = {}) {
 }
 ```
 
-### 8.2 使用示例
+### 9.2 使用示例
 
 ```js
 import { fetch } from './fetch-bridge-client.js';
@@ -752,16 +938,25 @@ fetch('https://example.com/hello.json')
 // 二进制响应（大图/字体）：握手协商出 hex+lz4 时，会用 lz4 压缩 + hex 编码 + 分片
 fetch('https://example.com/big.png', { raw: true })
   .then((resp) => { if (resp.ok) console.log('bytes:', resp.body.length); });
+
+// v4 在线媒体/大文件：每个通过 CRC 校验且连续的块立即交给播放器，
+// 不在手表上组装完整文件。Promise 在可靠 final 帧到达后完成。
+fetch('https://example.com/live/audio.mp3', {
+  raw: true,
+  stream: true,
+  onChunk(bytes) { player.append(bytes); },
+}).then(() => player.end());
 ```
 
-### 8.3 按设备能力调参
+### 9.3 按设备能力调参
 
 直接改 `LOCAL_CAPS` 即可，无需改动其它代码：
 
 ```js
 // 极简 RTOS：宁愿多传字节也别让我解压/复杂解码
 const LOCAL_CAPS = {
-  version: 3,
+  version: 4,
+  stream: true,
   chunk: true,
   maxChunkSize: 2048,
   encodings:    ['hex'],           // 只能 hex
@@ -772,7 +967,8 @@ const LOCAL_CAPS = {
 
 // 带宽极差但 CPU 够：deflate 优先
 const LOCAL_CAPS = {
-  version: 3,
+  version: 4,
+  stream: true,
   chunk: true,
   maxChunkSize: 8192,
   encodings:    ['base64', 'hex'],
@@ -786,7 +982,7 @@ const LOCAL_CAPS = {
 > 省略 `ack` 只会退回 v2 无流控分片——小响应能用，大响应有撑爆通道的风险。
 > 启用后唯一的额外成本就是 §8.1 里那几行 `sendAck`（收到分片即回一个累计序号）。
 
-### 8.4 最小集成（仅 v1，不分片不压缩）
+### 9.4 最小集成（仅 v1，不分片不压缩）
 
 如果不打算改造旧应用：
 
@@ -796,7 +992,7 @@ const LOCAL_CAPS = {
 
 ---
 
-## 9. 实现备注 (For Agents)
+## 10. 实现备注 (For Agents)
 
 修改本协议时，参考以下源文件：
 
@@ -812,13 +1008,14 @@ const LOCAL_CAPS = {
 - `src/fetch.rs:186-216` — `build_plan` / `pick_compression` / `pick_encoding`：响应编码与 `ack_window` 决策入口。
 - `src/fetch.rs:293-477` — `send_unchunked` / `send_chunked`（含 `ack:true` 头部标志与 ACK/无流控分支）/ `handle_ack`。
 - `src/transfer.rs` — **ACK 流控状态机**：在途分片注册表、滑动窗口 `pump`、`begin`（首批发送）、`on_ack`（推进窗口/go-back-N 重传/完成清理）。死锁修复的核心。
-- `src/lib.rs:dispatch_interconnect` — `fetch-ack` tag 的分发入口（仅推进窗口，不触发 UI 重渲染）。
+- `src/stream.rs` — **v4 有限内存流状态机**：持有 HTTP source、窗口内未确认帧、CRC32、最终帧、重传、取消与超时清理。
+- `src/lib.rs:dispatch_interconnect` — v3/v4 ACK 与取消 tag 的异步分发入口。
 
 兼容性硬性约束：
 
 1. **永远先发头部消息**：分片模式下 `tag:"fetch"` 头部（含 `ack` 标志）必须先于任何 `fetch-chunk` 出门。
 2. **不要重命名/重排** `resp.{ok,status,statusText,headers,body,raw}` 六个 v1 字段。
-3. **未知字段必须可被旧端忽略**：所有 v2/v3 新增字段都是可选元信息；对没声明 `caps` 的对端，
+3. **未知字段必须可被旧端忽略**：所有 v2/v3/v4 新增字段都是可选元信息；对没声明对应 `caps` 的对端，
    插件**禁止**输出 `chunked` / `bodyEncoding != legacy` / `compression != none` / `ack`。
 4. **`base64` 必须永远在 `SUPPORTED_ENCODINGS` 里**：它是兜底通用编码，任何对端都假定能解码。
 5. **`none` 必须永远在 `SUPPORTED_COMPRESSIONS` 里**：是默认无压缩选项。
@@ -827,11 +1024,18 @@ const LOCAL_CAPS = {
 8. 修改默认 `LOCAL_MAX_CHUNK_SIZE` 时要同时评估 QAIC 单帧上限 + 编码膨胀（hex 2×）+ JSON 外壳长度。
 9. **ACK 流控只在 `negotiated.ackWindow > 0` 时启用**（即双方都声明 `ack`）；否则分片必须走无流控老路，
    绝不能等待一个永远不会来的 `fetch-ack`。`ackWindow` 必有上下限（`[1, 64]`）：下限防瞬间停滞，上限防退化回无界 blast。
-10. **发送分片绝不持有发送状态锁**：`transfer.rs` 在锁内只挑选要发的分片，释放锁后再做阻塞式 `send_qaic_message`，
-    避免阻塞期间的重入把同一把锁锁死——这正是当初死锁的同类陷阱。
+10. **发送帧绝不持有发送状态锁**：状态机在锁内只挑选帧/推进游标，释放锁后再 `.await` 宿主
+    `send_qaic_message` future，避免跨挂起点持锁或发生重入死锁。
 11. **不要在一次 `on_event` 里同步发完所有分片**：ACK 流控每批最多发 `window` 个就返回，靠后续 `fetch-ack`
     续传，从而把控制权交还宿主让传输排空。回退到无界 blast 会重新引入死锁。
 12. **不要把超大响应退回 legacy 单消息**：缺失协商时，`send_unchunked` 必须用 `MAX_UNCHUNKED_WIRE_LEN`
     拦截大包并返回错误；否则一次错误的能力过期就会重新把整张图片塞进 `tag:"fetch"`。
-13. **长传输必须刷新会话活跃时间**：`fetch` 请求和 `fetch-ack` 都要调用握手保活逻辑，避免图片分片
+13. **长传输必须刷新会话活跃时间**：`fetch` 请求和 v3/v4 ACK 都要调用握手保活逻辑，避免传输
     还在正常推进时协商能力被误判过期。
+14. **`wit_bindgen::spawn` 不是线程池**：每个导出事件只创建一个组件任务，并由其返回的 `FutureReader`
+    维持生命周期；协议处理和宿主 future 在同一任务内按序 `.await`。禁止为每个帧单独 `spawn`，否则会破坏头部/序号顺序。
+15. **v4 生产必须由事件被动推进**：首窗之后只允许由 `fetch-stream-ack` 读取下一窗；不得创建永久循环
+    把 `wit_bindgen::spawn` 当作 `tokio::spawn` 使用。Timer 只做有界清理，不负责持续抽取数据。
+16. 当前 `waki 0.5.1` 的 HTTP `send/chunk` 本身使用 WASI blocking pollable；本实现已避免全量读取和无界循环，
+    但若源站长期无新字节，单次 ACK 事件的 HTTP chunk 读取仍可能占用组件执行。要达到严格“可挂起而不阻塞”的直播源，
+    AstroBox Host 需要提供返回 WIT `future` 的 HTTP stream-read/import，再在同一 `FutureReader` 任务内 `.await`；不得用额外 `spawn` 伪装成异步。

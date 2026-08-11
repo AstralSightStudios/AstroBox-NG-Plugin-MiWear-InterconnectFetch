@@ -111,6 +111,11 @@ fn prune(reg: &mut Registry, now: Instant) {
     });
 }
 
+pub fn prune_idle() {
+    let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
+    prune(&mut reg, Instant::now());
+}
+
 /// Advance `next` as far as the window and chunk count allow, collecting the
 /// chunk byte-ranges to ship. Returns `(seq, bytes)` pairs to encode + send
 /// *after* the registry lock is released — we never run a blocking
@@ -127,7 +132,7 @@ fn pump(t: &mut PendingTransfer) -> Vec<(usize, Vec<u8>)> {
 }
 
 /// Encode and ship the collected chunks. Runs outside the registry lock.
-fn flush(
+async fn flush(
     addr: &str,
     pkg: &str,
     id: Option<&str>,
@@ -147,7 +152,7 @@ fn flush(
         msg.insert("seq".to_string(), Value::from(seq));
         msg.insert("total".to_string(), Value::from(chunk_count));
         msg.insert("data".to_string(), Value::String(data));
-        interconnect::send_json(addr, pkg, FETCH_CHUNK_TAG, Value::Object(msg));
+        interconnect::send_json(addr, pkg, FETCH_CHUNK_TAG, Value::Object(msg)).await;
     }
 }
 
@@ -157,7 +162,7 @@ fn flush(
 ///
 /// `payload` is the post-compression body; `chunk_size`, `encoding` and
 /// `window` come straight from the negotiated transfer plan.
-pub fn begin(
+pub async fn begin(
     addr: &str,
     pkg: &str,
     id: Option<&str>,
@@ -206,7 +211,7 @@ pub fn begin(
         sends.len(),
     );
 
-    flush(addr, pkg, id, encoding, chunk_count, sends);
+    flush(addr, pkg, id, encoding, chunk_count, sends).await;
 }
 
 /// Handle a peer `fetch-ack`. `ack` is the next contiguous chunk index the peer
@@ -221,7 +226,7 @@ pub fn begin(
 ///   * `base` reaching `chunk_count` ⇒ fully delivered; drop the transfer.
 ///
 /// Unknown ids are ignored (a late ACK for a finished/timed-out transfer).
-pub fn on_ack(addr: &str, pkg: &str, id: Option<&str>, ack: usize) {
+pub async fn on_ack(addr: &str, pkg: &str, id: Option<&str>, ack: usize) {
     let now = Instant::now();
     let result = {
         let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
@@ -258,7 +263,7 @@ pub fn on_ack(addr: &str, pkg: &str, id: Option<&str>, ack: usize) {
     };
 
     let (encoding, chunk_count, sends, done) = result;
-    flush(addr, pkg, id, encoding, chunk_count, sends);
+    flush(addr, pkg, id, encoding, chunk_count, sends).await;
 
     if done {
         tracing::info!(

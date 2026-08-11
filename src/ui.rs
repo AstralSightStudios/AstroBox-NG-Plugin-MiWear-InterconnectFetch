@@ -262,7 +262,9 @@ fn device_section(devices: &[(String, String)]) -> ui::Element {
     col = col.child(
         ui::Element::new(ui::ElementType::Div, None)
             .margin_top(6)
-            .child(primary_button("刷新设备并重新注册").on(ui::Event::Click, EVENT_REFRESH_DEVICES)),
+            .child(
+                primary_button("刷新设备并重新注册").on(ui::Event::Click, EVENT_REFRESH_DEVICES),
+            ),
     );
 
     col
@@ -271,7 +273,11 @@ fn device_section(devices: &[(String, String)]) -> ui::Element {
 fn device_row(name: &str, addr: &str) -> ui::Element {
     let name_el = ui::Element::new(
         ui::ElementType::P,
-        Some(if name.is_empty() { "未命名设备" } else { name }),
+        Some(if name.is_empty() {
+            "未命名设备"
+        } else {
+            name
+        }),
     )
     .size(14)
     .text_color(COLOR_TEXT_PRIMARY);
@@ -448,7 +454,11 @@ fn app_row(entry: &AppEntry) -> ui::Element {
     };
     let status_label = ui::Element::new(
         ui::ElementType::P,
-        Some(if entry.enabled { "已允许联网" } else { "已禁用" }),
+        Some(if entry.enabled {
+            "已允许联网"
+        } else {
+            "已禁用"
+        }),
     )
     .size(12)
     .text_color(status_color);
@@ -472,16 +482,11 @@ fn app_row(entry: &AppEntry) -> ui::Element {
     .size(11)
     .text_color(COLOR_TEXT_MUTED);
 
-    let last_url = entry
-        .last_url
-        .clone()
-        .unwrap_or_else(|| "—".to_string());
-    let last_url_el = ui::Element::new(
-        ui::ElementType::P,
-        Some(&format!("最近 URL: {}", last_url)),
-    )
-    .size(11)
-    .text_color(COLOR_TEXT_MUTED);
+    let last_url = entry.last_url.clone().unwrap_or_else(|| "—".to_string());
+    let last_url_el =
+        ui::Element::new(ui::ElementType::P, Some(&format!("最近 URL: {}", last_url)))
+            .size(11)
+            .text_color(COLOR_TEXT_MUTED);
 
     let last_seen_el = ui::Element::new(
         ui::ElementType::P,

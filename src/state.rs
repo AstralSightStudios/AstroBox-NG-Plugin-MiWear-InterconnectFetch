@@ -108,13 +108,7 @@ pub fn install_loaded_apps(entries: Vec<AppEntry>) {
 }
 
 pub fn is_enabled(pkg_name: &str) -> bool {
-    with_state(|state| {
-        state
-            .apps
-            .get(pkg_name)
-            .map(|e| e.enabled)
-            .unwrap_or(true)
-    })
+    with_state(|state| state.apps.get(pkg_name).map(|e| e.enabled).unwrap_or(true))
 }
 
 pub fn record_request(pkg_name: &str, addr: &str, url: Option<&str>) {

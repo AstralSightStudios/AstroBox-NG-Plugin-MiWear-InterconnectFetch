@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::codec::{BodyEncoding, Compression, SUPPORTED_COMPRESSIONS, SUPPORTED_ENCODINGS};
 use crate::interconnect;
@@ -20,8 +20,11 @@ const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Protocol version we advertise.
 ///   v1 — legacy single-message fetch (base64 + no compression).
 ///   v2 — adds optional response chunking via `fetch-chunk`.
-///   v3 — adds optional `encodings` / `compressions` negotiation.
-const LOCAL_PROTOCOL_VERSION: u32 = 3;
+///   v3 — adds optional encodings/compressions and ACK-paced chunking.
+///   v4 — adds open-ended, bounded-memory response streams.
+const LOCAL_PROTOCOL_VERSION: u32 = 4;
+/// Whether this build can keep an HTTP response open and forward it incrementally.
+const LOCAL_STREAM_SUPPORTED: bool = true;
 /// Whether we support emitting chunked fetch responses.
 const LOCAL_CHUNK_SUPPORTED: bool = true;
 /// Largest binary payload (in bytes) we will pack into a single chunk message
@@ -90,7 +93,10 @@ struct PeerCaps {
     /// Compressions the peer can *decompress*, in preferred order. Empty means
     /// the peer didn't advertise — treat as `none` only.
     compressions: Vec<Compression>,
-    /// Whether the peer will emit `fetch-ack` frames for chunked responses. If
+    /// Whether the peer supports v4 open-ended response streams. Streaming also
+    /// requires ACK support so the producer never outruns the watch.
+    stream: bool,
+    /// Whether the peer will emit `fetch-ack` / `fetch-stream-ack` frames.
     /// false we must not wait on ACKs (fall back to the legacy blast path).
     ack: bool,
     /// Peer's requested in-flight window in chunks. `0` = unspecified ⇒ use the
@@ -105,6 +111,9 @@ pub struct NegotiatedCaps {
     pub protocol_version: u32,
     pub chunked: bool,
     pub chunk_size: usize,
+    /// True only when both sides negotiated protocol v4 streaming and ACK flow
+    /// control. v1-v3 sessions can therefore never enter the stream path.
+    pub stream: bool,
     /// Encodings the peer accepts, in *peer's* preference order (preferred
     /// first). The producer should walk this list and pick the first one it
     /// also supports. Empty ⇒ peer didn't advertise ⇒ assume base64-only
@@ -205,7 +214,7 @@ pub fn negotiated_chunk_size(addr: &str, pkg: &str) -> Option<usize> {
 /// New in v3: encoding / compression negotiation via `caps.encodings` and
 ///            `caps.compressions` arrays (peer preference order preserved).
 /// Peers that omit `caps` keep the legacy single-message base64 behaviour.
-pub fn handle_packet(addr: &str, pkg: &str, packet: &Value) {
+pub async fn handle_packet(addr: &str, pkg: &str, packet: &Value) {
     let count_in = packet.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
     let peer_caps = parse_caps(packet.get("caps"));
     let negotiated = peer_caps.map(negotiate);
@@ -229,7 +238,11 @@ pub fn handle_packet(addr: &str, pkg: &str, packet: &Value) {
                 .unwrap_or_default(),
             negotiated
                 .as_ref()
-                .map(|c| c.compressions.iter().map(|x| x.as_str()).collect::<Vec<_>>())
+                .map(|c| c
+                    .compressions
+                    .iter()
+                    .map(|x| x.as_str())
+                    .collect::<Vec<_>>())
                 .unwrap_or_default(),
         );
     }
@@ -244,7 +257,8 @@ pub fn handle_packet(addr: &str, pkg: &str, packet: &Value) {
                 "count": next,
                 "caps": local_caps_value(),
             }),
-        );
+        )
+        .await;
     }
 }
 
@@ -252,7 +266,7 @@ pub fn handle_packet(addr: &str, pkg: &str, packet: &Value) {
 /// If we have no session yet, kick one off by sending a count=0 packet and
 /// optimistically assume it will succeed (the watch side replies very
 /// quickly in practice; the JS version doesn't actually await the response).
-pub fn ensure_open(addr: &str, pkg: &str) {
+pub async fn ensure_open(addr: &str, pkg: &str) {
     if is_open(addr, pkg) {
         record_activity(addr, pkg);
         return;
@@ -266,7 +280,8 @@ pub fn ensure_open(addr: &str, pkg: &str) {
             "count": 0,
             "caps": local_caps_value(),
         }),
-    );
+    )
+    .await;
     // Optimistically mark as open so the immediate response can ship; if the
     // watch never answers we'll time out naturally. Caps stay `None` until the
     // peer actually replies with their own — that means the immediately-sent
@@ -286,6 +301,7 @@ fn parse_caps(v: Option<&Value>) -> Option<PeerCaps> {
             .unwrap_or(0) as usize,
         encodings: parse_string_list(obj.get("encodings"), BodyEncoding::parse),
         compressions: parse_string_list(obj.get("compressions"), Compression::parse),
+        stream: obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false),
         ack: obj.get("ack").and_then(|v| v.as_bool()).unwrap_or(false),
         ack_window: obj.get("ackWindow").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
     })
@@ -333,7 +349,7 @@ fn negotiate(peer: PeerCaps) -> NegotiatedCaps {
     // ACK-paced delivery only kicks in when we're actually chunking *and* the
     // peer promised to send `fetch-ack` frames. A window of 0 means "no ACK
     // flow control" and signals the producer to use the legacy blast path.
-    let ack_window = if chunked && LOCAL_ACK_SUPPORTED && peer.ack {
+    let ack_window = if version >= 3 && chunked && LOCAL_ACK_SUPPORTED && peer.ack {
         let requested = if peer.ack_window == 0 {
             DEFAULT_ACK_WINDOW
         } else {
@@ -343,11 +359,15 @@ fn negotiate(peer: PeerCaps) -> NegotiatedCaps {
     } else {
         0
     };
+    // v4 streams are deliberately stricter than v3 finite chunks: an
+    // open-ended producer is legal only with cumulative ACK backpressure.
+    let stream = version >= 4 && LOCAL_STREAM_SUPPORTED && peer.stream && chunked && ack_window > 0;
 
     NegotiatedCaps {
         protocol_version: version,
         chunked,
         chunk_size,
+        stream,
         encodings,
         compressions,
         ack_window,
@@ -364,7 +384,46 @@ fn local_caps_value() -> Value {
         "maxChunkSize": LOCAL_MAX_CHUNK_SIZE,
         "encodings": encodings,
         "compressions": compressions,
+        "stream": LOCAL_STREAM_SUPPORTED,
         "ack": LOCAL_ACK_SUPPORTED,
         "ackWindow": DEFAULT_ACK_WINDOW,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caps(version: u32, stream: bool, ack: bool) -> PeerCaps {
+        PeerCaps {
+            protocol_version: version,
+            chunked: true,
+            max_chunk_size: 2048,
+            encodings: vec![BodyEncoding::Base64],
+            compressions: vec![Compression::None],
+            stream,
+            ack,
+            ack_window: 4,
+        }
+    }
+
+    #[test]
+    fn v4_stream_requires_explicit_v4_and_ack() {
+        assert!(!negotiate(caps(3, true, true)).stream);
+        assert!(!negotiate(caps(4, true, false)).stream);
+        assert!(negotiate(caps(4, true, true)).stream);
+    }
+
+    #[test]
+    fn legacy_versions_cannot_enable_newer_flow_control() {
+        let v2 = negotiate(caps(2, true, true));
+        assert_eq!(v2.protocol_version, 2);
+        assert_eq!(v2.ack_window, 0);
+        assert!(!v2.stream);
+
+        let v3 = negotiate(caps(3, true, true));
+        assert_eq!(v3.protocol_version, 3);
+        assert_eq!(v3.ack_window, 4);
+        assert!(!v3.stream);
+    }
 }

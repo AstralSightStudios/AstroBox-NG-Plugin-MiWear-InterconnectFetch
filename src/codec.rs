@@ -73,18 +73,12 @@ impl Compression {
 
 /// Encodings this plugin knows how to *produce*. Order is informational only —
 /// the peer's preference order wins during negotiation.
-pub const SUPPORTED_ENCODINGS: &[BodyEncoding] = &[
-    BodyEncoding::Base64,
-    BodyEncoding::Hex,
-    BodyEncoding::Text,
-];
+pub const SUPPORTED_ENCODINGS: &[BodyEncoding] =
+    &[BodyEncoding::Base64, BodyEncoding::Hex, BodyEncoding::Text];
 
 /// Compressions this plugin knows how to *produce*.
-pub const SUPPORTED_COMPRESSIONS: &[Compression] = &[
-    Compression::None,
-    Compression::Deflate,
-    Compression::Lz4,
-];
+pub const SUPPORTED_COMPRESSIONS: &[Compression] =
+    &[Compression::None, Compression::Deflate, Compression::Lz4];
 
 /// Bodies smaller than this byte threshold are sent uncompressed even when a
 /// compressor was negotiated — the per-call overhead isn't worth it and most
@@ -116,17 +110,28 @@ pub fn compress(data: &[u8], algo: Compression) -> Vec<u8> {
 /// UTF-8 — callers must fall back to a binary encoding in that case.
 pub fn encode(data: &[u8], enc: BodyEncoding) -> Result<String, ()> {
     match enc {
-        BodyEncoding::Text => {
-            std::str::from_utf8(data).map(|s| s.to_string()).map_err(|_| ())
-        }
+        BodyEncoding::Text => std::str::from_utf8(data)
+            .map(|s| s.to_string())
+            .map_err(|_| ()),
         BodyEncoding::Base64 => Ok(base64_encode(data)),
         BodyEncoding::Hex => Ok(hex_encode(data)),
     }
 }
 
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            let mask = 0u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
+}
+
 fn base64_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     let mut i = 0;
     while i + 3 <= data.len() {
@@ -162,4 +167,27 @@ fn hex_encode(data: &[u8]) -> String {
         out.push(HEX[(b & 0x0F) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crc32_matches_ieee_vector() {
+        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+        assert_eq!(crc32(b""), 0);
+    }
+
+    #[test]
+    fn stream_encodings_are_stable() {
+        assert_eq!(
+            encode(&[0, 1, 0xfe, 0xff], BodyEncoding::Hex),
+            Ok("0001feff".into())
+        );
+        assert_eq!(
+            encode(b"hello", BodyEncoding::Base64),
+            Ok("aGVsbG8=".into())
+        );
+    }
 }

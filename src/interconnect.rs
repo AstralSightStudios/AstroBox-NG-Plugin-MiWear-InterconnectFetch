@@ -121,9 +121,8 @@ pub fn refresh_installed_apps() {
     let mut out: Vec<InstalledApp> = Vec::new();
     let mut queried_addrs: HashSet<String> = HashSet::new();
     for (addr, device_name) in devices {
-        let result = wit_bindgen::block_on(
-            thirdpartyapp::get_thirdparty_app_list(&addr).into_future(),
-        );
+        let result =
+            wit_bindgen::block_on(thirdpartyapp::get_thirdparty_app_list(&addr).into_future());
         match result {
             Ok(apps) => {
                 queried_addrs.insert(addr.clone());
@@ -217,7 +216,11 @@ fn register_pair(addr: &str, pkg_name: &str) -> bool {
         wit_bindgen::block_on(register::register_interconnect_recv(addr, pkg_name).into_future());
     match result {
         Ok(()) => {
-            tracing::info!("registered interconnect-recv addr={} pkg={}", addr, pkg_name);
+            tracing::info!(
+                "registered interconnect-recv addr={} pkg={}",
+                addr,
+                pkg_name
+            );
             true
         }
         Err(()) => {
@@ -253,7 +256,7 @@ pub fn register_for_all_devices(pkg_name: &str) -> usize {
 
 /// Send a JSON message back over QAIC to the same (addr, pkg_name) that we
 /// received from.
-pub fn send_json(addr: &str, pkg_name: &str, tag: &str, body: Value) {
+pub async fn send_json(addr: &str, pkg_name: &str, tag: &str, body: Value) -> bool {
     let mut payload = Map::<String, Value>::new();
     payload.insert("tag".to_string(), Value::String(tag.to_string()));
     match body {
@@ -274,9 +277,9 @@ pub fn send_json(addr: &str, pkg_name: &str, tag: &str, body: Value) {
         tag,
         text.len()
     );
-    let result = wit_bindgen::block_on(
-        interconnect::send_qaic_message(addr, pkg_name, &text).into_future(),
-    );
+    let result = interconnect::send_qaic_message(addr, pkg_name, &text)
+        .into_future()
+        .await;
     if result.is_err() {
         tracing::error!(
             "interconnect send failed: addr={} pkg={} tag={}",
@@ -284,5 +287,8 @@ pub fn send_json(addr: &str, pkg_name: &str, tag: &str, body: Value) {
             pkg_name,
             tag
         );
+        false
+    } else {
+        true
     }
 }

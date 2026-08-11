@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
-use waki::{Client, Method};
+use serde_json::{Map, Value, json};
+use waki::{Client, Method, Response};
 
-use crate::codec::{self, BodyEncoding, Compression, COMPRESS_MIN_SIZE};
+use crate::codec::{self, BodyEncoding, COMPRESS_MIN_SIZE, Compression};
 use crate::handshake::{self, NegotiatedCaps};
 use crate::interconnect;
 use crate::state;
+use crate::stream;
 use crate::transfer;
 
 /// Tag used for the fetch request/response exchange (matches the JS client).
@@ -26,6 +27,9 @@ pub const FETCH_ACK_TAG: &str = "fetch-ack";
 /// `fetch` frame and can wedge the host UI / QAIC transport. Normal large
 /// responses must use negotiated chunking instead.
 const MAX_UNCHUNKED_WIRE_LEN: usize = 16 * 1024;
+/// Responses at least this large are automatically streamed for v4 peers when
+/// the caller did not explicitly choose `options.stream`.
+const AUTO_STREAM_MIN_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct FetchRequest {
@@ -47,6 +51,11 @@ pub struct FetchOptions {
     /// instead of trying to decode them as UTF-8 text.
     #[serde(default)]
     pub raw: Option<bool>,
+    /// v4 streaming preference. `true` forces a stream when v4 was negotiated,
+    /// `false` keeps the finite v1-v3 response path, and omission automatically
+    /// streams large or audio/video responses.
+    #[serde(default)]
+    pub stream: Option<bool>,
 }
 
 struct FetchResponse {
@@ -60,7 +69,34 @@ struct FetchResponse {
     raw: bool,
 }
 
-pub fn handle_request(addr: &str, pkg: &str, body: Value) {
+struct HttpResponse {
+    response: Response,
+    ok: bool,
+    status: u16,
+    status_text: &'static str,
+    headers: Map<String, Value>,
+    raw_requested: bool,
+}
+
+impl HttpResponse {
+    fn into_buffered(self) -> Result<FetchResponse, String> {
+        let body_bytes = self
+            .response
+            .body()
+            .map_err(|e| format!("read body failed: {e}"))?;
+        let raw = self.raw_requested || std::str::from_utf8(&body_bytes).is_err();
+        Ok(FetchResponse {
+            ok: self.ok,
+            status: self.status,
+            status_text: self.status_text,
+            headers: self.headers,
+            body_bytes,
+            raw,
+        })
+    }
+}
+
+pub async fn handle_request(addr: &str, pkg: &str, body: Value) {
     let req: FetchRequest = match serde_json::from_value::<FetchRequest>(body) {
         Ok(r) => r,
         Err(err) => {
@@ -72,7 +108,7 @@ pub fn handle_request(addr: &str, pkg: &str, body: Value) {
     let id = req.id.clone();
     let url = req.url.clone();
     state::record_request(pkg, addr, Some(&url));
-    handshake::ensure_open(addr, pkg);
+    handshake::ensure_open(addr, pkg).await;
 
     let options = req.options.unwrap_or_default();
     let method = options
@@ -81,6 +117,7 @@ pub fn handle_request(addr: &str, pkg: &str, body: Value) {
         .unwrap_or("GET")
         .to_ascii_uppercase();
     let raw_mode = options.raw.unwrap_or(false);
+    let stream_preference = options.stream;
 
     tracing::info!(
         "fetch begin: pkg={} addr={} id={} method={} url={}",
@@ -94,7 +131,29 @@ pub fn handle_request(addr: &str, pkg: &str, body: Value) {
     match perform_request(&method, &url, options.headers, options.body, raw_mode) {
         Ok(resp) => {
             let status = resp.status;
-            match send_response(addr, pkg, id.as_deref(), resp) {
+            let caps = handshake::negotiated_caps(addr, pkg);
+            let use_stream = caps.as_ref().map(|c| c.stream).unwrap_or(false)
+                && should_stream(&resp, stream_preference);
+
+            let result = if use_stream {
+                match id.as_deref() {
+                    Some(id) if !id.is_empty() => {
+                        send_streaming(addr, pkg, id, resp, caps.as_ref().unwrap()).await
+                    }
+                    _ => {
+                        let message = "protocol v4 streaming requires a non-empty fetch id";
+                        send_error(addr, pkg, id.as_deref(), message).await;
+                        Err(message.to_string())
+                    }
+                }
+            } else {
+                match resp.into_buffered() {
+                    Ok(resp) => send_response(addr, pkg, id.as_deref(), resp).await,
+                    Err(err) => Err(err),
+                }
+            };
+
+            match result {
                 Ok(()) => state::record_result(pkg, true, Some(format!("HTTP {}", status))),
                 Err(err) => state::record_result(pkg, false, Some(err)),
             }
@@ -102,7 +161,7 @@ pub fn handle_request(addr: &str, pkg: &str, body: Value) {
         Err(err) => {
             tracing::error!("fetch error: {err}");
             state::record_result(pkg, false, Some(err.clone()));
-            send_error(addr, pkg, id.as_deref(), &err);
+            send_error(addr, pkg, id.as_deref(), &err).await;
         }
     }
 }
@@ -113,7 +172,7 @@ fn perform_request(
     headers: Option<HashMap<String, Value>>,
     body: Option<String>,
     raw: bool,
-) -> Result<FetchResponse, String> {
+) -> Result<HttpResponse, String> {
     let client = Client::new();
     let parsed_method = parse_method(method);
     let mut req = client.request(parsed_method, url);
@@ -140,13 +199,8 @@ fn perform_request(
     }
 
     let response = req.send().map_err(|e| format!("send failed: {e}"))?;
-
     let status = response.status_code();
     let resp_headers_raw = response.headers().clone();
-    let body_bytes = response
-        .body()
-        .map_err(|e| format!("read body failed: {e}"))?;
-
     let mut headers = Map::new();
     for (name, value) in resp_headers_raw.iter() {
         let key = name.as_str().to_string();
@@ -154,19 +208,111 @@ fn perform_request(
         headers.insert(key, Value::String(val));
     }
 
-    // Auto-promote to raw when the bytes aren't valid UTF-8, so binary content
-    // still survives the JSON hop even if the caller forgot to set raw=true.
-    let raw_flag = raw || std::str::from_utf8(&body_bytes).is_err();
-    let ok = (200..300).contains(&status);
-
-    Ok(FetchResponse {
-        ok,
+    Ok(HttpResponse {
+        response,
+        ok: (200..300).contains(&status),
         status,
         status_text: status_text(status),
         headers,
-        body_bytes,
-        raw: raw_flag,
+        raw_requested: raw,
     })
+}
+
+fn should_stream(resp: &HttpResponse, preference: Option<bool>) -> bool {
+    if let Some(preference) = preference {
+        return preference;
+    }
+    let content_type = resp
+        .headers
+        .get("content-type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if content_type.starts_with("audio/") || content_type.starts_with("video/") {
+        return true;
+    }
+    resp.headers
+        .get("content-length")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|len| len >= AUTO_STREAM_MIN_BYTES)
+        .unwrap_or(false)
+}
+
+fn stream_encoding(caps: &NegotiatedCaps) -> BodyEncoding {
+    caps.encodings
+        .iter()
+        .copied()
+        .find(|enc| matches!(enc, BodyEncoding::Base64 | BodyEncoding::Hex))
+        .unwrap_or(BodyEncoding::Base64)
+}
+
+async fn send_streaming(
+    addr: &str,
+    pkg: &str,
+    id: &str,
+    resp: HttpResponse,
+    caps: &NegotiatedCaps,
+) -> Result<(), String> {
+    let content_type = resp
+        .headers
+        .get("content-type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let raw = resp.raw_requested
+        || !(content_type.starts_with("text/")
+            || content_type.contains("json")
+            || content_type.contains("xml")
+            || content_type.contains("javascript"));
+    let content_length = resp
+        .headers
+        .get("content-length")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<usize>().ok());
+    let encoding = stream_encoding(caps);
+
+    let mut resp_obj = Map::new();
+    resp_obj.insert("ok".into(), Value::Bool(resp.ok));
+    resp_obj.insert("status".into(), Value::from(resp.status));
+    resp_obj.insert("statusText".into(), Value::String(resp.status_text.into()));
+    resp_obj.insert("headers".into(), Value::Object(resp.headers.clone()));
+    resp_obj.insert("body".into(), Value::String(String::new()));
+    resp_obj.insert("raw".into(), Value::Bool(raw));
+    resp_obj.insert("stream".into(), Value::Bool(true));
+    resp_obj.insert("chunkSize".into(), Value::from(caps.chunk_size));
+    resp_obj.insert(
+        "bodyEncoding".into(),
+        Value::String(encoding.as_str().into()),
+    );
+    resp_obj.insert("compression".into(), Value::String("none".into()));
+    resp_obj.insert("ack".into(), Value::Bool(true));
+    resp_obj.insert("checksum".into(), Value::String("crc32".into()));
+    if let Some(content_length) = content_length {
+        resp_obj.insert("contentLength".into(), Value::from(content_length));
+    }
+
+    if !interconnect::send_json(
+        addr,
+        pkg,
+        FETCH_TAG,
+        wrap_with_id(Some(id), "resp", Value::Object(resp_obj)),
+    )
+    .await
+    {
+        return Err("failed to send v4 stream header".to_string());
+    }
+    stream::begin(
+        addr,
+        pkg,
+        id,
+        resp.response,
+        caps.chunk_size,
+        encoding,
+        caps.ack_window,
+    )
+    .await;
+    Ok(())
 }
 
 /// Composed transfer plan for one response. Built from negotiated caps plus
@@ -285,7 +431,7 @@ fn pick_encoding(
     BodyEncoding::Base64
 }
 
-fn send_response(
+async fn send_response(
     addr: &str,
     pkg: &str,
     id: Option<&str>,
@@ -298,14 +444,14 @@ fn send_response(
     // chunked arm can take ownership and hand the payload off to `transfer`.
     match plan.chunk_size {
         Some(cs) => {
-            send_chunked(addr, pkg, id, &resp, plan, cs);
+            send_chunked(addr, pkg, id, &resp, plan, cs).await;
             Ok(())
         }
-        None => send_unchunked(addr, pkg, id, &resp, &plan),
+        None => send_unchunked(addr, pkg, id, &resp, &plan).await,
     }
 }
 
-fn send_unchunked(
+async fn send_unchunked(
     addr: &str,
     pkg: &str,
     id: Option<&str>,
@@ -328,9 +474,8 @@ fn send_unchunked(
             plan.encoding.as_str(),
             plan.compression.as_str(),
         );
-        let message =
-            "response too large for unchunked interconnect frame; complete FetchBridge handshake with chunk=true";
-        send_error(addr, pkg, id, message);
+        let message = "response too large for unchunked interconnect frame; complete FetchBridge handshake with chunk=true";
+        send_error(addr, pkg, id, message).await;
         return Err(message.to_string());
     }
 
@@ -359,16 +504,21 @@ fn send_unchunked(
         resp_obj.insert("originalBytes".into(), Value::from(plan.original_bytes));
     }
 
-    interconnect::send_json(
+    if interconnect::send_json(
         addr,
         pkg,
         FETCH_TAG,
         wrap_with_id(id, "resp", Value::Object(resp_obj)),
-    );
-    Ok(())
+    )
+    .await
+    {
+        Ok(())
+    } else {
+        Err("failed to send fetch response".to_string())
+    }
 }
 
-fn send_chunked(
+async fn send_chunked(
     addr: &str,
     pkg: &str,
     id: Option<&str>,
@@ -433,7 +583,8 @@ fn send_chunked(
         pkg,
         FETCH_TAG,
         wrap_with_id(id, "resp", Value::Object(resp_obj)),
-    );
+    )
+    .await;
 
     // Header is out (compat rule #1). Now ship the body.
     if ack_paced {
@@ -449,7 +600,8 @@ fn send_chunked(
             chunk_size,
             plan.encoding,
             plan.ack_window,
-        );
+        )
+        .await;
         return;
     }
 
@@ -466,14 +618,14 @@ fn send_chunked(
         msg.insert("seq".to_string(), Value::from(seq));
         msg.insert("total".to_string(), Value::from(chunk_count));
         msg.insert("data".to_string(), Value::String(encoded));
-        interconnect::send_json(addr, pkg, FETCH_CHUNK_TAG, Value::Object(msg));
+        interconnect::send_json(addr, pkg, FETCH_CHUNK_TAG, Value::Object(msg)).await;
     }
 }
 
 /// Handle a peer `fetch-ack` frame: `{ id?, ack }`. `ack` is the next
 /// contiguous chunk index the peer still needs. Drives the sliding window so
 /// the next batch of chunks goes out (see `transfer::on_ack`).
-pub fn handle_ack(addr: &str, pkg: &str, body: Value) {
+pub async fn handle_ack(addr: &str, pkg: &str, body: Value) {
     handshake::record_activity(addr, pkg);
     let id = body.get("id").and_then(|v| v.as_str());
     let ack = body.get("ack").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -484,10 +636,45 @@ pub fn handle_ack(addr: &str, pkg: &str, body: Value) {
         id.unwrap_or(""),
         ack
     );
-    transfer::on_ack(addr, pkg, id, ack);
+    transfer::on_ack(addr, pkg, id, ack).await;
 }
 
-fn send_error(addr: &str, pkg: &str, id: Option<&str>, message: &str) {
+pub async fn handle_stream_ack(addr: &str, pkg: &str, body: Value) {
+    handshake::record_activity(addr, pkg);
+    let Some(id) = body
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        tracing::warn!(
+            "ignored v4 stream ACK without id: pkg={} addr={}",
+            pkg,
+            addr
+        );
+        return;
+    };
+    let ack = body.get("ack").and_then(Value::as_u64).unwrap_or(0) as usize;
+    stream::on_ack(addr, pkg, id, ack).await;
+}
+
+pub async fn handle_stream_cancel(addr: &str, pkg: &str, body: Value) {
+    handshake::record_activity(addr, pkg);
+    let Some(id) = body
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        tracing::warn!(
+            "ignored v4 stream cancel without id: pkg={} addr={}",
+            pkg,
+            addr
+        );
+        return;
+    };
+    stream::cancel(addr, pkg, id);
+}
+
+async fn send_error(addr: &str, pkg: &str, id: Option<&str>, message: &str) {
     let resp_value = json!({
         "ok": false,
         "status": 0,
@@ -496,7 +683,7 @@ fn send_error(addr: &str, pkg: &str, id: Option<&str>, message: &str) {
         "body": "",
         "raw": false,
     });
-    interconnect::send_json(addr, pkg, FETCH_TAG, wrap_with_id(id, "resp", resp_value));
+    interconnect::send_json(addr, pkg, FETCH_TAG, wrap_with_id(id, "resp", resp_value)).await;
 }
 
 fn wrap_with_id(id: Option<&str>, key: &str, value: Value) -> Value {

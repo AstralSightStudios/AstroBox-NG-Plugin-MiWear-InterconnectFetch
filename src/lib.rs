@@ -9,6 +9,7 @@ pub mod interconnect;
 pub mod logger;
 pub mod persist;
 pub mod state;
+pub mod stream;
 pub mod transfer;
 pub mod ui;
 
@@ -31,16 +32,21 @@ impl event::Guest for MyPlugin {
         match event_type {
             EventType::InterconnectMessage => {
                 let parsed = interconnect::parse_message(&event_payload);
-                dispatch_interconnect(&parsed.addr, &parsed.pkg_name, &parsed.data);
+                // Preserve the host's established v3 event lifecycle: finish all
+                // handling before resolving this exported event. The protocol is
+                // still ACK/event-driven between frames; `block_on` here only
+                // drives this one bounded event transaction and does not create a
+                // detached worker or a receive loop.
+                wit_bindgen::block_on(dispatch_interconnect(
+                    &parsed.addr,
+                    &parsed.pkg_name,
+                    &parsed.data,
+                ));
             }
             EventType::PluginMessage => {
                 tracing::info!("plugin-message: {}", event_payload);
             }
             EventType::DeviceAction => {
-                // Device state changed (connect/disconnect). Refresh
-                // immediately so any visible UI re-renders against the new
-                // device set; the throttle is sidestepped because device
-                // events are far rarer than UI interactions.
                 interconnect::refresh_connected_devices();
                 interconnect::refresh_installed_apps();
                 for pkg in state::pkg_names() {
@@ -48,10 +54,11 @@ impl event::Guest for MyPlugin {
                 }
                 ui::rerender();
             }
-            EventType::ProviderAction => {}
-            EventType::DeeplinkAction => {}
-            EventType::TransportPacket => {}
-            EventType::Timer => {}
+            EventType::Timer => {
+                stream::prune_idle();
+                transfer::prune_idle();
+            }
+            EventType::ProviderAction | EventType::DeeplinkAction | EventType::TransportPacket => {}
         }
 
         immediate_string(String::new())
@@ -67,6 +74,9 @@ impl event::Guest for MyPlugin {
     }
 
     fn on_ui_render(element_id: _rt::String) -> FutureReader<()> {
+        // Host rendering is synchronous in the current v3 UI ABI. Complete the
+        // render first, then return an already-resolving FutureReader; scheduling
+        // render itself behind spawn can leave Host and guest waiting on each other.
         ui::render_main_ui(&element_id);
         immediate_unit()
     }
@@ -76,7 +86,7 @@ impl event::Guest for MyPlugin {
     }
 }
 
-fn dispatch_interconnect(addr: &str, pkg: &str, data: &str) {
+async fn dispatch_interconnect(addr: &str, pkg: &str, data: &str) {
     state::ensure_app(pkg);
 
     if !state::is_enabled(pkg) {
@@ -117,18 +127,23 @@ fn dispatch_interconnect(addr: &str, pkg: &str, data: &str) {
 
     match tag.as_str() {
         handshake::HS_TAG => {
-            handshake::handle_packet(addr, pkg, &body_value);
+            handshake::handle_packet(addr, pkg, &body_value).await;
             state::record_request(pkg, addr, None);
             ui::rerender();
         }
         fetch::FETCH_TAG => {
-            fetch::handle_request(addr, pkg, body_value);
+            fetch::handle_request(addr, pkg, body_value).await;
             ui::rerender();
         }
         fetch::FETCH_ACK_TAG => {
-            // Pure flow-control frame: advance the chunk window. No UI churn —
-            // these arrive once per chunk during a large transfer.
-            fetch::handle_ack(addr, pkg, body_value);
+            // Pure flow-control frame: advance the v3 finite-chunk window.
+            fetch::handle_ack(addr, pkg, body_value).await;
+        }
+        stream::FETCH_STREAM_ACK_TAG => {
+            fetch::handle_stream_ack(addr, pkg, body_value).await;
+        }
+        stream::FETCH_STREAM_CANCEL_TAG => {
+            fetch::handle_stream_cancel(addr, pkg, body_value).await;
         }
         other => {
             tracing::warn!(
