@@ -83,6 +83,11 @@ pub fn ui_event_processor(_evtype: event::Event, event_id: &str, payload_raw: &s
     match event_id {
         EVENT_ADD_PKG_INPUT => {
             state::set_pending_add(payload.value.unwrap_or_default());
+            // Re-render so the controlled input reflects what the user just
+            // typed. Use render_without_auto_refresh rather than rerender() so
+            // each keystroke doesn't also re-query devices and re-register
+            // receivers (that would spam the host and is throttled anyway).
+            render_without_auto_refresh();
         }
         EVENT_ADD_PKG_SUBMIT => {
             let pkg = state::take_pending_add().trim().to_string();
